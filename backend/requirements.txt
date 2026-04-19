@@ -1,0 +1,13 @@
+flask>=3.0.0
+flask-cors
+google-api-python-client
+google-auth
+google-auth-httplib2
+httplib2
+langchain==0.3.*
+langchain-core
+pydantic
+pandas
+duckduckgo-search
+requests
+python-dotenv

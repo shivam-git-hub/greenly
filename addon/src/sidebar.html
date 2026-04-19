@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="UTF-8">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background: #fff;
+      color: #1a1a1a;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ── Header ── */
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      padding: 14px 16px 13px;
+      border-bottom: 1px solid #ebebeb;
+      flex-shrink: 0;
+    }
+
+    .header-title {
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: -0.3px;
+    }
+
+    /* ── Chat area ── */
+    .chat-area {
+      flex: 1;
+      overflow-y: auto;
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .chat-area::-webkit-scrollbar { width: 3px; }
+    .chat-area::-webkit-scrollbar-track { background: transparent; }
+    .chat-area::-webkit-scrollbar-thumb { background: #ddd; border-radius: 2px; }
+
+    .message {
+      max-width: 88%;
+      padding: 8px 12px;
+      font-size: 13px;
+      line-height: 1.55;
+      word-break: break-word;
+      white-space: pre-wrap;
+    }
+
+    .message.user {
+      align-self: flex-end;
+      background: #1a1a1a;
+      color: #fff;
+      border-radius: 12px 12px 3px 12px;
+    }
+
+    .message.assistant {
+      align-self: flex-start;
+      background: #f4f4f4;
+      color: #1a1a1a;
+      border-radius: 12px 12px 12px 3px;
+    }
+
+    .message.error {
+      align-self: flex-start;
+      background: #fff2f2;
+      color: #c0392b;
+      border-radius: 12px 12px 12px 3px;
+      font-size: 12px;
+    }
+
+    /* ── Typing indicator ── */
+    .typing-indicator {
+      align-self: flex-start;
+      background: #f4f4f4;
+      padding: 11px 14px;
+      border-radius: 12px 12px 12px 3px;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .typing-indicator span {
+      width: 6px;
+      height: 6px;
+      background: #999;
+      border-radius: 50%;
+      animation: dot-bounce 1.2s infinite ease-in-out;
+    }
+
+    .typing-indicator span:nth-child(2) { animation-delay: 0.18s; }
+    .typing-indicator span:nth-child(3) { animation-delay: 0.36s; }
+
+    @keyframes dot-bounce {
+      0%, 60%, 100% { transform: translateY(0); opacity: 0.35; }
+      30% { transform: translateY(-5px); opacity: 1; }
+    }
+
+    /* ── Controls ── */
+    .controls {
+      flex-shrink: 0;
+      padding: 9px 16px 12px;
+      border-top: 1px solid #ebebeb;
+    }
+
+    .toggles {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    .toggle-group {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex: 1;
+    }
+
+    .toggle-label {
+      font-size: 10px;
+      font-weight: 600;
+      color: #aaa;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      white-space: nowrap;
+    }
+
+    .segmented {
+      display: flex;
+      background: #f0f0f0;
+      border-radius: 7px;
+      padding: 2px;
+      flex: 1;
+      gap: 1px;
+    }
+
+    .segmented button {
+      flex: 1;
+      border: none;
+      background: transparent;
+      padding: 4px 2px;
+      font-size: 11px;
+      font-family: 'Inter', sans-serif;
+      font-weight: 500;
+      color: #888;
+      border-radius: 5px;
+      cursor: pointer;
+      transition: background 0.12s, color 0.12s, box-shadow 0.12s;
+      white-space: nowrap;
+    }
+
+    .segmented button:hover:not(.active) { color: #555; }
+
+    .segmented button.active {
+      background: #fff;
+      color: #1a1a1a;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+
+    /* ── Input row ── */
+    .input-row {
+      display: flex;
+      align-items: flex-end;
+      gap: 8px;
+      background: #f4f4f4;
+      border-radius: 10px;
+      padding: 8px 8px 8px 13px;
+      transition: box-shadow 0.15s;
+    }
+
+    .input-row:focus-within {
+      box-shadow: 0 0 0 2px #1a1a1a20;
+    }
+
+    textarea {
+      flex: 1;
+      border: none;
+      background: transparent;
+      font-family: 'Inter', sans-serif;
+      font-size: 13px;
+      color: #1a1a1a;
+      resize: none;
+      outline: none;
+      line-height: 1.45;
+      min-height: 20px;
+      max-height: 120px;
+      overflow-y: auto;
+    }
+
+    textarea::placeholder { color: #bbb; }
+    textarea:disabled { opacity: 0.5; }
+
+    .send-btn {
+      width: 30px;
+      height: 30px;
+      border-radius: 7px;
+      background: #1a1a1a;
+      border: none;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      transition: opacity 0.15s, transform 0.1s;
+    }
+
+    .send-btn:hover:not(:disabled) { opacity: 0.82; transform: scale(0.97); }
+    .send-btn:active:not(:disabled) { transform: scale(0.93); }
+    .send-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <!-- Bold pencil icon -->
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"
+            stroke="#1a1a1a" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    <span class="header-title">Greenly</span>
+  </div>
+
+  <div class="chat-area" id="chatArea"></div>
+
+  <div class="controls">
+    <div class="toggles">
+      <div class="toggle-group">
+        <span class="toggle-label">Effort</span>
+        <div class="segmented" id="effortToggle">
+          <button class="active" data-value="fast">Fast</button>
+          <button data-value="pro">Pro</button>
+          <button data-value="auto">Auto</button>
+        </div>
+      </div>
+      <div class="toggle-group">
+        <span class="toggle-label">Mode</span>
+        <div class="segmented" id="modeToggle">
+          <button class="active" data-value="ask">Ask</button>
+          <button data-value="build">Build</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="input-row">
+      <textarea id="queryInput" placeholder="Ask anything…" rows="1"></textarea>
+      <button class="send-btn" id="sendBtn" title="Send">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M22 2L11 13" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M22 2L15 22L11 13L2 9L22 2Z" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+
+  <script>
+    var effortValue = 'fast';
+    var modeValue   = 'ask';
+
+    // ── Segmented controls ──────────────────────────────────────────────────────
+    function initToggle(id, setter) {
+      var container = document.getElementById(id);
+      container.addEventListener('click', function (e) {
+        var btn = e.target.closest('button');
+        if (!btn) return;
+        container.querySelectorAll('button').forEach(function (b) { b.classList.remove('active'); });
+        btn.classList.add('active');
+        setter(btn.dataset.value);
+      });
+    }
+
+    initToggle('effortToggle', function (v) { effortValue = v; });
+    initToggle('modeToggle',   function (v) { modeValue   = v; });
+
+    // ── Auto-resize textarea ────────────────────────────────────────────────────
+    var textarea = document.getElementById('queryInput');
+
+    textarea.addEventListener('input', function () {
+      this.style.height = 'auto';
+      this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+    });
+
+    textarea.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
+
+    document.getElementById('sendBtn').addEventListener('click', sendMessage);
+
+    // ── Chat helpers ────────────────────────────────────────────────────────────
+    function appendMessage(role, text) {
+      var area = document.getElementById('chatArea');
+      var div  = document.createElement('div');
+      div.className = 'message ' + role;
+      div.textContent = text;
+      area.appendChild(div);
+      area.scrollTop = area.scrollHeight;
+    }
+
+    function showTyping() {
+      var area = document.getElementById('chatArea');
+      var div  = document.createElement('div');
+      div.id   = 'typingIndicator';
+      div.className = 'typing-indicator';
+      div.innerHTML = '<span></span><span></span><span></span>';
+      area.appendChild(div);
+      area.scrollTop = area.scrollHeight;
+    }
+
+    function hideTyping() {
+      var el = document.getElementById('typingIndicator');
+      if (el) el.remove();
+    }
+
+    function setLoading(on) {
+      document.getElementById('sendBtn').disabled = on;
+      document.getElementById('queryInput').disabled = on;
+    }
+
+    // ── Send ────────────────────────────────────────────────────────────────────
+    function sendMessage() {
+      var query = textarea.value.trim();
+      if (!query) return;
+
+      appendMessage('user', query);
+      textarea.value = '';
+      textarea.style.height = 'auto';
+      showTyping();
+      setLoading(true);
+
+      google.script.run
+        .withSuccessHandler(function (response) {
+          hideTyping();
+          setLoading(false);
+          var text = (response && response.response) ? response.response : 'Done.';
+          appendMessage('assistant', text);
+        })
+        .withFailureHandler(function (err) {
+          hideTyping();
+          setLoading(false);
+          var msg = (err && (err.message || err.name)) || 'Something went wrong.';
+          appendMessage('error', 'Error: ' + msg);
+        })
+        .sendChatMessage(query, modeValue, effortValue);
+    }
+  </script>
+</body>
+</html>

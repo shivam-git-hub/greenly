@@ -1,0 +1,20 @@
+# Secrets — never commit
+token.json
+credentials.json
+backend/.env
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Metafiles (mirrors .claudeignore)
+metafiles/
