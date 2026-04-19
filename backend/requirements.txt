@@ -11,4 +11,7 @@ pydantic
 pandas
 duckduckgo-search
 requests
+pdfplumber
+beautifulsoup4
+lxml
 python-dotenv

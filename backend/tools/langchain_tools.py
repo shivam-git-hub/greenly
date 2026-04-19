@@ -28,6 +28,7 @@ from .formula_utils.trace_dependents import trace_dependents
 from .sheet_structure.create_sheet import create_sheet
 from .common_tools.common_tools import (
     web_search,
+    fetch_url,
     run_python,
     load_sheet_to_df,
     write_df_to_sheet,
@@ -209,6 +210,10 @@ class WebSearchInput(BaseModel):
     query: str = Field(..., description="Search query string")
     num_results: int = Field(5, description="Maximum number of results to return")
 
+class FetchUrlInput(BaseModel):
+    url: str = Field(..., description="Full URL to fetch (http/https). Supports HTML pages and PDF files.")
+    max_chars: int = Field(20000, description="Maximum characters of text to return")
+
 class RunPythonInput(BaseModel):
     code: str = Field(..., description="Python code to execute in the sandbox")
     timeout: int = Field(30, description="Maximum execution time in seconds")
@@ -334,10 +339,13 @@ def create_python_tools(service) -> list:
 
 
 def create_research_tools() -> list:
-    """Web search tool. No Sheets service required."""
+    """Web search and URL fetch tools. No Sheets service required."""
 
     def _web_search(query: str, num_results: int = 5):
         return json.dumps(web_search(query, num_results), default=str)
+
+    def _fetch_url(url: str, max_chars: int = 20000):
+        return json.dumps(fetch_url(url, max_chars), default=str)
 
     return [
         StructuredTool.from_function(
@@ -345,5 +353,11 @@ def create_research_tools() -> list:
             name=web_search.__name__,
             description=web_search.__doc__ or web_search.__name__,
             args_schema=WebSearchInput,
+        ),
+        StructuredTool.from_function(
+            func=_fetch_url,
+            name=fetch_url.__name__,
+            description=fetch_url.__doc__ or fetch_url.__name__,
+            args_schema=FetchUrlInput,
         ),
     ]

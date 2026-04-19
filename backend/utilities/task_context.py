@@ -1,3 +1,5 @@
+from dataclasses import dataclass, field
+
 @dataclass
 class TaskContext:
     user_request: str
@@ -9,7 +11,7 @@ class TaskContext:
     # Set by planner
     plan: dict | None = None
     clarifying_questions: list[str] = field(default_factory=list)
-    clarifying_answers: dict[str, str] = field(default_factory=dict)
+    user_notes: list[str] = field(default_factory=list)
     
     # Set by executor
     execution_report: dict | None = None
@@ -18,4 +20,6 @@ class TaskContext:
     verification_report: dict | None = None
     
     # Loop control
-    status: str = "completed"  # planning | awaiting_clarification | executing | verifying | completed
+    current_iteration: int = 0
+    max_iteration: int = 5
+    status: str = "completed"  # planning | awaiting_clarification | executing | verifying | completed | replanning | failed

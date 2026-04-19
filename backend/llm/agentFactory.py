@@ -30,14 +30,16 @@ class LLMAgents:
         self.generic_tools = self.read_tools + self.write_tools + self.python_tools + self.research_tools
 
         self.planner_prompt_path = os.path.join(os.path.dirname(__file__), "prompts", "planner.txt")
+        self.replanner_prompt_path = os.path.join(os.path.dirname(__file__), "prompts", "replanner.txt")
         self.researcher_prompt_path = os.path.join(os.path.dirname(__file__), "prompts", "researcher.txt")
         self.verifier_prompt_path = os.path.join(os.path.dirname(__file__), "prompts", "verifier.txt")
         self.execution_prompt_path = os.path.join(os.path.dirname(__file__), "prompts", "execution.txt")
         self.generic_prompt_path = os.path.join(os.path.dirname(__file__), "prompts", "generic.txt")
-        self.basic_prompt_path = os.path.join(os.path.dirname(__file__), "prompts", "basic.txt")
 
         with open(self.planner_prompt_path, "r", encoding="utf-8") as f:
             self.planner_prompt = f.read().strip()
+        with open(self.replanner_prompt_path, "r", encoding="utf-8") as f:
+            self.replanner_prompt = f.read().strip()
         with open(self.researcher_prompt_path, "r", encoding="utf-8") as f:
             self.researcher_prompt = f.read().strip()
         with open(self.verifier_prompt_path, "r", encoding="utf-8") as f:
@@ -46,47 +48,59 @@ class LLMAgents:
             self.execution_prompt = f.read().strip()
         with open(self.generic_prompt_path, "r", encoding="utf-8") as f:
             self.generic_prompt = f.read().strip()
-        with open(self.basic_prompt_path, "r", encoding="utf-8") as f:
-            self.basic_prompt = f.read().strip()
 
         self.plannerPromptTemplate = ChatPromptTemplate.from_messages([
+            MessagePlaceholder(variable_name="task_context", optional=True),
             ("system", self.planner_prompt),
             MessagesPlaceholder(variable_name="chat_history", optional=True),
             ("user", "{input}"),
             MessagesPlaceholder(variable_name="agent_scratchpad"),
         ])
+        self.replannerPromptTemplate = ChatPromptTemplate.from_messages([
+            MessagePlaceholder(variable_name="task_context", optional=True),
+            ("system", self.replanner_prompt),
+            MessagesPlaceholder(variable_name="chat_history", optional=True),
+            ("user", "{input}"),
+            MessagesPlaceholder(variable_name="agent_scratchpad"),
+        ])
         self.researcherPromptTemplate = ChatPromptTemplate.from_messages([
+            MessagePlaceholder(variable_name="task_context", optional=True),
             ("system", self.researcher_prompt),
             MessagesPlaceholder(variable_name="chat_history", optional=True),
             ("user", "{input}"),
             MessagesPlaceholder(variable_name="agent_scratchpad"),
         ])
         self.verifierPromptTemplate = ChatPromptTemplate.from_messages([
+            MessagePlaceholder(variable_name="task_context", optional=True),
             ("system", self.verifier_prompt),
             MessagesPlaceholder(variable_name="chat_history", optional=True),
             ("user", "{input}"),
             MessagesPlaceholder(variable_name="agent_scratchpad"),
         ])
         self.executionPromptTemplate = ChatPromptTemplate.from_messages([
+            MessagePlaceholder(variable_name="task_context", optional=True),
             ("system", self.execution_prompt),
             MessagesPlaceholder(variable_name="chat_history", optional=True),
             ("user", "{input}"),
             MessagesPlaceholder(variable_name="agent_scratchpad"),
         ])
         self.genericPromptTemplate = ChatPromptTemplate.from_messages([
+            MessagePlaceholder(variable_name="task_context", optional=True),
             ("system", self.generic_prompt),
             MessagesPlaceholder(variable_name="chat_history", optional=True),
             ("user", "{input}"),
             MessagesPlaceholder(variable_name="agent_scratchpad"),
         ])
         self.basicPromptTemplate = ChatPromptTemplate.from_messages([
-            ("system", self.basic_prompt),
+            MessagePlaceholder(variable_name="task_context", optional=True),
+            ("system", "{system_prompt}"),
             MessagesPlaceholder(variable_name="chat_history", optional=True),
             ("user", "{input}"),
             MessagesPlaceholder(variable_name="agent_scratchpad"),
         ])
 
         self.plannerAgent = create_tool_calling_agent(self.llm, self.planner_tools, self.plannerPromptTemplate)
+        self.replannerAgent = create_tool_calling_agent(self.llm, self.replanner_tools, self.replannerPromptTemplate)
         self.researcherAgent = create_tool_calling_agent(self.llm, self.research_tools, self.researcherPromptTemplate)
         self.verifierAgent = create_tool_calling_agent(self.llm, self.verification_tools, self.verifierPromptTemplate)
         self.executionAgent = create_tool_calling_agent(self.llm, self.execution_tools, self.executionPromptTemplate)
@@ -118,6 +132,8 @@ def getAgent(agentType: str, llm_type: str = "fast"):
 
     if agentType == "planner":
         return AgentExecutor(agent=llmAgents.plannerAgent, tools=llmAgents.planner_tools,max_iterations=30, verbose=True)
+    if agentType == "replanner":
+        return AgentExecutor(agent=llmAgents.replannerAgent, tools=llmAgents.replanner_tools,max_iterations=30, verbose=True)
     if agentType == "researcher":
         return AgentExecutor(agent=llmAgents.researcherAgent, tools=llmAgents.research_tools,max_iterations=30, verbose=True)
     if agentType == "verifier":

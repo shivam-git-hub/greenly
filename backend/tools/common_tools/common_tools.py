@@ -142,6 +142,75 @@ def web_search(query: str, num_results: int = 5) -> dict:
     }
 
 
+# ── URL Fetcher ────────────────────────────────────────────────────────────────
+
+_FETCH_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; GreenlyCrawler/1.0)"
+}
+_MAX_FETCH_BYTES = 10 * 1024 * 1024  # 10 MB cap before parsing
+
+
+def fetch_url(url: str, max_chars: int = 20000) -> dict:
+    """
+    Fetch the text content of a URL. Supports HTML web pages and PDF files.
+    Use this after web_search to read the actual content of a page or document.
+    Returns up to max_chars characters of extracted text.
+    """
+    if not isinstance(url, str) or not url.strip().startswith(("http://", "https://")):
+        return {"success": False, "url": url, "error": "url must start with http:// or https://"}
+
+    try:
+        resp = requests.get(url, headers=_FETCH_HEADERS, timeout=20, stream=True)
+        resp.raise_for_status()
+
+        content_type = resp.headers.get("Content-Type", "").lower()
+        is_pdf = "application/pdf" in content_type or url.lower().split("?")[0].endswith(".pdf")
+
+        raw = b""
+        for chunk in resp.iter_content(chunk_size=65536):
+            raw += chunk
+            if len(raw) >= _MAX_FETCH_BYTES:
+                break
+
+        if is_pdf:
+            import pdfplumber
+            text_parts = []
+            with pdfplumber.open(io.BytesIO(raw)) as pdf:
+                for page in pdf.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text_parts.append(page_text)
+            text = "\n\n".join(text_parts)
+            detected_type = "pdf"
+        elif "text/html" in content_type:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(raw, "lxml")
+            for tag in soup(["script", "style", "nav", "footer", "header"]):
+                tag.decompose()
+            text = soup.get_text(separator="\n")
+            # collapse excessive blank lines
+            import re
+            text = re.sub(r"\n{3,}", "\n\n", text).strip()
+            detected_type = "html"
+        else:
+            text = raw.decode("utf-8", errors="replace")
+            detected_type = "text"
+
+        truncated = len(text) > max_chars
+        return {
+            "success": True,
+            "url": url,
+            "content_type": detected_type,
+            "text": text[:max_chars],
+            "truncated": truncated,
+        }
+
+    except requests.RequestException as e:
+        return {"success": False, "url": url, "error": f"Request failed: {e}"}
+    except Exception as e:
+        return {"success": False, "url": url, "error": f"Parsing failed: {e}"}
+
+
 # ── Python Sandbox ─────────────────────────────────────────────────────────────
 
 def _make_safe_print(buf: io.StringIO):
