@@ -85,9 +85,18 @@ def parse_a1_range(a1: str) -> dict:
         start = end = cell_range
 
     def parse_cell(cell):
-        m = re.match(r"([A-Za-z]+)(\d+)", cell)
+        # Full reference like B4
+        m = re.match(r"^([A-Za-z]+)(\d+)$", cell)
         if m:
             return int(m.group(2)) - 1, col_letter_to_index(m.group(1))
+        # Column-only like A or AA
+        m = re.match(r"^([A-Za-z]+)$", cell)
+        if m:
+            return None, col_letter_to_index(m.group(1))
+        # Row-only like 1 or 10
+        m = re.match(r"^(\d+)$", cell)
+        if m:
+            return int(m.group(1)) - 1, None
         return None, None
 
     sr, sc = parse_cell(start)
@@ -115,11 +124,12 @@ def a1_to_grid_range(a1: str, sheet_id: int) -> dict:
     """
     p = parse_a1_range(a1)
     gr = {"sheetId": sheet_id}
+    if p["startColumnIndex"] is not None:
+        gr["startColumnIndex"] = p["startColumnIndex"]
+        gr["endColumnIndex"] = p["endColumnIndex"]
     if p["startRowIndex"] is not None:
         gr["startRowIndex"] = p["startRowIndex"]
         gr["endRowIndex"] = p["endRowIndex"]
-        gr["startColumnIndex"] = p["startColumnIndex"]
-        gr["endColumnIndex"] = p["endColumnIndex"]
     return gr
 
 

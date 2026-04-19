@@ -12,6 +12,6 @@ def get_llm(type: str = "fast"):
         ChatGoogleGenerativeAI: The LangChain agent executor compatible LLM object.
     """
     if type == "fast":
-        return ChatGoogleGenerativeAI(model="gemini-3.0-flash")
+        return ChatGoogleGenerativeAI(model="gemini-2.5-flash")
     else:
-        return ChatGoogleGenerativeAI(model="gemini-3.0-pro")
+        return ChatGoogleGenerativeAI(model="gemini-2.5-pro")

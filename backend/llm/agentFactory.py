@@ -3,10 +3,10 @@ from langchain.agents import create_tool_calling_agent, AgentExecutor
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from .llmFactory import get_llm
-from backend.tools.langchain_tools import create_read_tools, create_research_tools
-from backend.tools.utils import build_sheets_service
-from backend.utils import load_access_token_from_file
-from backend.tools.langchain_tools import create_read_tools, create_research_tools, create_write_tools, create_python_tools
+from tools.langchain_tools import create_read_tools, create_research_tools
+from tools.utils import build_sheets_service
+from utils import load_access_token_from_file
+from tools.langchain_tools import create_read_tools, create_research_tools, create_write_tools, create_python_tools
 
 
 class LLMAgents:
@@ -20,13 +20,13 @@ class LLMAgents:
         self.research_tools = create_research_tools()
         self.read_tools = create_read_tools(self.sheet_service)
         self.write_tools = create_write_tools(self.sheet_service)
-        self.python_tools = create_python_tools()
+        self.python_tools = create_python_tools(self.sheet_service)
 
         self.planner_tools = self.research_tools + self.read_tools
         self.execution_tools = self.write_tools + self.read_tools + self.python_tools + self.research_tools
-        self.verification_tools = self.read_tools
-        self.compaction_tools = None
-        self.basic_tools = None
+        self.verification_tools = self.read_tools + self.python_tools
+        self.compaction_tools = []
+        self.basic_tools = []
         self.generic_tools = self.read_tools + self.write_tools + self.python_tools + self.research_tools
 
         self.planner_prompt_path = os.path.join(os.path.dirname(__file__), "prompts", "planner.txt")
@@ -44,6 +44,10 @@ class LLMAgents:
             self.verifier_prompt = f.read().strip()
         with open(self.execution_prompt_path, "r", encoding="utf-8") as f:
             self.execution_prompt = f.read().strip()
+        with open(self.generic_prompt_path, "r", encoding="utf-8") as f:
+            self.generic_prompt = f.read().strip()
+        with open(self.basic_prompt_path, "r", encoding="utf-8") as f:
+            self.basic_prompt = f.read().strip()
 
         self.plannerPromptTemplate = ChatPromptTemplate.from_messages([
             ("system", self.planner_prompt),

@@ -16,9 +16,9 @@ from dotenv import load_dotenv
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
-from .cell_content.write_values import write_values
-from .read_structure.read_range import read_range
-from .read_structure.read_sheet_structure import read_sheet_structure
+from tools.cell_content.write_values import write_values
+from tools.read_structure.read_range import read_range
+from tools.read_structure.read_sheet_structure import read_sheet_structure
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -266,30 +266,50 @@ def load_sheet_to_df(
     sheetTitle: str,
     columns: Optional[List[str]] = None,
     varName: str = "df",
+    range: Optional[str] = None,
+    hasHeader: bool = True,
     _ns: dict = None,
 ) -> dict:
     """
     Read a Google Sheet tab into a pandas DataFrame and store it in the sandbox
-    namespace under varName. The first row is treated as column headers.
-    Duplicate / empty headers are de-duplicated (e.g. 'Sales', 'Sales_1').
-    Rows wider than the header row are preserved by synthesising extra
-    'ColN' headers; a warning is returned if this happens.
+    namespace under varName.
+
+    Loading modes:
+    - Default: loads the full used range of the sheet.
+    - range: if provided (A1 notation, e.g. 'E1:H50' or 'Sheet1!E1:H50'), loads
+      exactly that cell range instead of the full sheet.
+
+    Header behaviour (hasHeader):
+    - True (default): first row of the loaded range is used as column names.
+      Duplicate / empty headers are de-duplicated (e.g. 'Sales', 'Sales_1').
+      Rows wider than the header row get synthesised 'ColN' overflow names.
+    - False: no header row is consumed; all rows become data and columns are
+      named Col0, Col1, Col2, … Use this when the range contains only numbers
+      or when you want to skip header detection entirely.
+
+    Column filtering (columns):
+    - Accepts header name strings (e.g. ['Revenue', 'Profit Margin %']).
+      NOT spreadsheet column letters like 'A' or 'E'.
+    - Only valid when hasHeader=True. Ignored when hasHeader=False.
+    - Omit to keep all columns.
     """
     warnings: list = []
     try:
-        structure = read_sheet_structure(service, spreadsheetId)
-        if not structure.get("success"):
-            return structure
-
-        sheet_info = next(
-            (s for s in structure.get("sheets", []) if s["title"] == sheetTitle),
-            None,
-        )
-        if not sheet_info:
-            return {"success": False, "error": f"Sheet '{sheetTitle}' not found in spreadsheet"}
-
-        used_range = sheet_info.get("usedRange", "A1")
-        range_str = f"'{sheetTitle}'!{used_range}"
+        if range:
+            # Use caller-supplied range directly; prepend sheet name if absent
+            range_str = range if "!" in range else f"'{sheetTitle}'!{range}"
+        else:
+            structure = read_sheet_structure(service, spreadsheetId)
+            if not structure.get("success"):
+                return structure
+            sheet_info = next(
+                (s for s in structure.get("sheets", []) if s["title"] == sheetTitle),
+                None,
+            )
+            if not sheet_info:
+                return {"success": False, "error": f"Sheet '{sheetTitle}' not found in spreadsheet"}
+            used_range = sheet_info.get("usedRange", "A1")
+            range_str = f"'{sheetTitle}'!{used_range}"
 
         result = read_range(service, spreadsheetId, range_str)
         if not result.get("success"):
@@ -297,41 +317,44 @@ def load_sheet_to_df(
 
         cells = result.get("cells", [])
         if not cells:
-            return {"success": False, "error": f"Sheet '{sheetTitle}' appears to be empty"}
+            return {"success": False, "error": f"No data found in range '{range_str}'"}
 
-        raw_headers = [
-            (cell.get("value") or cell.get("displayValue"))
-            for cell in cells[0]
-        ]
-        rows = [
-            [
-                cell.get("value") if cell.get("value") is not None else cell.get("displayValue")
-                for cell in row
-            ]
-            for row in cells[1:]
-        ]
+        def _cell_val(cell):
+            v = cell.get("value")
+            return v if v is not None else cell.get("displayValue")
 
-        max_row_width = max((len(r) for r in rows), default=0)
-        header_width = len(raw_headers)
-        if max_row_width > header_width:
-            extra = max_row_width - header_width
-            raw_headers = list(raw_headers) + [None] * extra
-            warnings.append(
-                f"{extra} row(s) had more columns than headers; synthesised 'Col{header_width}'.."
-                f"'Col{max_row_width - 1}' names for the overflow."
-            )
+        if hasHeader:
+            raw_headers = [_cell_val(cell) for cell in cells[0]]
+            data_rows = [[_cell_val(cell) for cell in row] for row in cells[1:]]
 
-        headers = _dedupe_headers(raw_headers)
+            max_row_width = max((len(r) for r in data_rows), default=0)
+            header_width = len(raw_headers)
+            if max_row_width > header_width:
+                extra = max_row_width - header_width
+                raw_headers = list(raw_headers) + [None] * extra
+                warnings.append(
+                    f"{extra} row(s) had more columns than headers; synthesised "
+                    f"'Col{header_width}'..'Col{max_row_width - 1}' names for the overflow."
+                )
+
+            headers = _dedupe_headers(raw_headers)
+        else:
+            data_rows = [[_cell_val(cell) for cell in row] for row in cells]
+            n_cols = max((len(r) for r in data_rows), default=0)
+            headers = [f"Col{i}" for i in range(n_cols)]
+
         n_cols = len(headers)
-        rows = [r + [None] * (n_cols - len(r)) for r in rows]
-
-        df = pd.DataFrame(rows, columns=headers)
+        data_rows = [r + [None] * (n_cols - len(r)) for r in data_rows]
+        df = pd.DataFrame(data_rows, columns=headers)
 
         if columns:
-            missing = [c for c in columns if c not in df.columns]
-            if missing:
-                return {"success": False, "error": f"Columns not found in sheet: {missing}"}
-            df = df[columns]
+            if not hasHeader:
+                warnings.append("'columns' filter is ignored when hasHeader=False.")
+            else:
+                missing = [c for c in columns if c not in df.columns]
+                if missing:
+                    return {"success": False, "error": f"Columns not found in sheet: {missing}"}
+                df = df[columns]
 
         if _ns is not None:
             _ns[varName] = df
@@ -438,7 +461,9 @@ class RunPythonInput(BaseModel):
 class LoadSheetToDfInput(BaseModel):
     spreadsheetId: str = Field(..., description="Google Spreadsheet ID")
     sheetTitle: str = Field(..., description="Tab (sheet) name to load")
-    columns: Optional[List[str]] = Field(None, description="Column names to keep. Omit to load all columns.")
+    range: Optional[str] = Field(None, description="A1 notation range to load, e.g. 'E1:H50'. Omit to load the full used range of the sheet. Sheet name prefix is optional.")
+    hasHeader: bool = Field(True, description="If True (default), the first row is used as column names. Set False when the range has no header row (e.g. all-numeric data) — columns will be named Col0, Col1, etc.")
+    columns: Optional[List[str]] = Field(None, description="Header name strings to keep, e.g. ['Revenue', 'Profit Margin %']. NOT column letters like 'E'. Only applies when hasHeader=True. Omit to keep all columns.")
     varName: str = Field("df", description="Variable name for the DataFrame in the sandbox")
 
 
@@ -461,9 +486,11 @@ def create_python_tools(service) -> list:
         sheetTitle: str,
         columns: Optional[List[str]] = None,
         varName: str = "df",
+        range: Optional[str] = None,
+        hasHeader: bool = True,
     ):
         return json.dumps(
-            load_sheet_to_df(service, spreadsheetId, sheetTitle, columns, varName, _ns=ns),
+            load_sheet_to_df(service, spreadsheetId, sheetTitle, columns, varName, range, hasHeader, _ns=ns),
             default=str,
         )
 

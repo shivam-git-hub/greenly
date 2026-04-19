@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
-from backend.routes.app import create_app
+from routes.app import create_app
 
 app = create_app()
 

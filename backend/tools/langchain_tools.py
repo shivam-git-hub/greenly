@@ -1,11 +1,9 @@
 import json
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
 from .cell_content.write_values import write_values
-from .cell_content.validate_formula import validate_formula
-from .cell_content.write_formulas import write_formulas
 from .read_structure.read_range import read_range
 from .read_structure.read_sheet_structure import read_sheet_structure
 from .read_structure.get_chunk import get_chunk
@@ -42,7 +40,7 @@ from .common_tools.common_tools import (
 class WriteValuesInput(BaseModel):
     spreadsheetId: str
     range: str
-    values: list
+    values: List[List[Any]]
     valueInputOption: str = "USER_ENTERED"
 
 class ValidateFormulaInput(BaseModel):
@@ -53,7 +51,7 @@ class ValidateFormulaInput(BaseModel):
 class WriteFormulasInput(BaseModel):
     spreadsheetId: str
     range: str
-    formulas: list
+    formulas: List[List[str]]
     validateFirst: bool = True
     abortOnError: bool = True
 
@@ -74,16 +72,16 @@ class GetChunkInput(BaseModel):
 class ApplyCellFormatInput(BaseModel):
     spreadsheetId: str
     range: str
-    numberFormat: dict = None
-    backgroundColor: dict = None
-    textColor: dict = None
+    numberFormat: Optional[Dict[str, Any]] = None
+    backgroundColor: Optional[Dict[str, Any]] = None
+    textColor: Optional[Dict[str, Any]] = None
     bold: bool = None
     italic: bool = None
     fontSize: int = None
     horizontalAlignment: str = None
     verticalAlignment: str = None
     wrapStrategy: str = None
-    borders: dict = None
+    borders: Optional[Dict[str, Any]] = None
 
 class ClearCellFormatInput(BaseModel):
     spreadsheetId: str
@@ -97,13 +95,13 @@ class GetCellFormatInput(BaseModel):
 class AddConditionalFormatInput(BaseModel):
     spreadsheetId: str
     sheetId: int
-    ranges: list
+    ranges: List[Dict[str, Any]]
     ruleType: str
-    minColor: dict = None
-    midColor: dict = None
-    maxColor: dict = None
+    minColor: Optional[Dict[str, Any]] = None
+    midColor: Optional[Dict[str, Any]] = None
+    maxColor: Optional[Dict[str, Any]] = None
     formula: str = None
-    applyFormat: dict = None
+    applyFormat: Optional[Dict[str, Any]] = None
     priority: int = None
 
 class GetConditionalFormatsInput(BaseModel):
@@ -119,7 +117,7 @@ class CreateChartInput(BaseModel):
     spreadsheetId: str
     sheetId: int
     chartType: str
-    dataRanges: list
+    dataRanges: List[str]
     title: str = None
     anchorRow: int = 0
     anchorCol: int = 0
@@ -130,7 +128,7 @@ class CreateChartInput(BaseModel):
     xAxisLabel: str = None
     yAxisLabel: str = None
     legendPosition: str = "BOTTOM_LEGEND"
-    seriesColors: list = None
+    seriesColors: Optional[List[str]] = None
     headerCount: int = 1
 
 class GetChartsInput(BaseModel):
@@ -145,10 +143,10 @@ class CreatePivotTableInput(BaseModel):
     spreadsheetId: str
     sourceRange: str
     anchorCell: str
-    rows: list
-    values: list
-    columns: list = None
-    filters: list = None
+    rows: List[Dict[str, Any]]
+    values: List[Dict[str, Any]]
+    columns: Optional[List[Dict[str, Any]]] = None
+    filters: Optional[List[Dict[str, Any]]] = None
 
 class GetPivotTablesInput(BaseModel):
     spreadsheetId: str
@@ -175,7 +173,7 @@ class SetDataValidationInput(BaseModel):
     spreadsheetId: str
     range: str
     conditionType: str
-    values: list = None
+    values: Optional[List[str]] = None
     formula: str = None
     showDropdown: bool = True
     strict: bool = True
@@ -204,8 +202,8 @@ class CreateSheetInput(BaseModel):
     spreadsheetId: str
     title: str
     index: int = None
-    tabColor: dict = None
-    gridProperties: dict = None
+    tabColor: Optional[Dict[str, Any]] = None
+    gridProperties: Optional[Dict[str, Any]] = None
 
 class WebSearchInput(BaseModel):
     query: str = Field(..., description="Search query string")
@@ -218,7 +216,9 @@ class RunPythonInput(BaseModel):
 class LoadSheetToDfInput(BaseModel):
     spreadsheetId: str = Field(..., description="Google Spreadsheet ID")
     sheetTitle: str = Field(..., description="Tab (sheet) name to load")
-    columns: Optional[List[str]] = Field(None, description="Column names to keep. Omit to load all columns.")
+    range: Optional[str] = Field(None, description="A1 notation range to load, e.g. 'E1:H50'. Omit to load the full used range of the sheet. Sheet name prefix is optional.")
+    hasHeader: bool = Field(True, description="If True (default), the first row is used as column names. Set False when the range has no header row (e.g. all-numeric data) — columns will be named Col0, Col1, etc.")
+    columns: Optional[List[str]] = Field(None, description="Header name strings to keep, e.g. ['Revenue', 'Profit Margin %']. NOT column letters like 'E'. Only applies when hasHeader=True. Omit to keep all columns.")
     varName: str = Field("df", description="Variable name for the DataFrame in the sandbox")
 
 class WriteDfToSheetInput(BaseModel):
@@ -255,7 +255,6 @@ def create_read_tools(service) -> list:
         _wrap(get_pivot_tables, GetPivotTablesInput, service),
         _wrap(get_named_ranges, GetNamedRangesInput, service),
         _wrap(get_data_validations, GetDataValidationsInput, service),
-        _wrap(validate_formula, ValidateFormulaInput, service),
         _wrap(audit_formulas, AuditFormulasInput, service),
         _wrap(trace_dependents, TraceDependentsInput, service),
     ]
@@ -265,7 +264,6 @@ def create_write_tools(service) -> list:
     """Tools that mutate spreadsheet data, structure, or formatting."""
     return [
         _wrap(write_values, WriteValuesInput, service),
-        _wrap(write_formulas, WriteFormulasInput, service),
         _wrap(apply_cell_format, ApplyCellFormatInput, service),
         _wrap(clear_cell_format, ClearCellFormatInput, service),
         _wrap(add_conditional_format, AddConditionalFormatInput, service),
@@ -294,9 +292,11 @@ def create_python_tools(service) -> list:
         sheetTitle: str,
         columns: Optional[List[str]] = None,
         varName: str = "df",
+        range: Optional[str] = None,
+        hasHeader: bool = True,
     ):
         return json.dumps(
-            load_sheet_to_df(service, spreadsheetId, sheetTitle, columns, varName, _ns=ns),
+            load_sheet_to_df(service, spreadsheetId, sheetTitle, columns, varName, range, hasHeader, _ns=ns),
             default=str,
         )
 

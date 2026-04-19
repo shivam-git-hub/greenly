@@ -1,13 +1,85 @@
 import logging
+from collections import deque
 from ..utils import index_to_col_letter
 
 logger = logging.getLogger(__name__)
 
 
+def _cell_text(cell: dict):
+    uev = cell.get("userEnteredValue", {})
+    if not uev:
+        return None
+    if "stringValue" in uev:
+        v = uev["stringValue"]
+        return v if v != "" else None
+    if "numberValue" in uev:
+        v = uev["numberValue"]
+        return str(int(v)) if v == int(v) else str(v)
+    if "boolValue" in uev:
+        return str(uev["boolValue"])
+    if "formulaValue" in uev:
+        return uev["formulaValue"]
+    return None
+
+
+def _find_data_blocks(sheet: dict) -> list:
+    occupied = {}
+    for grid_data in sheet.get("data", []):
+        base_r = grid_data.get("startRow", 0)
+        base_c = grid_data.get("startColumn", 0)
+        for dr, row_data in enumerate(grid_data.get("rowData", [])):
+            for dc, cell in enumerate(row_data.get("values", [])):
+                val = _cell_text(cell)
+                if val is not None:
+                    occupied[(base_r + dr, base_c + dc)] = val
+
+    if not occupied:
+        return []
+
+    visited = set()
+    blocks = []
+
+    for seed in occupied:
+        if seed in visited:
+            continue
+        component = set()
+        queue = deque([seed])
+        while queue:
+            pos = queue.popleft()
+            if pos in visited or pos not in occupied:
+                continue
+            visited.add(pos)
+            component.add(pos)
+            r, c = pos
+            for nb in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+                if nb not in visited and nb in occupied:
+                    queue.append(nb)
+
+        min_r = min(r for r, c in component)
+        max_r = max(r for r, c in component)
+        min_c = min(c for r, c in component)
+        max_c = max(c for r, c in component)
+
+        header_names = [
+            occupied.get((min_r, c)) for c in range(min_c, max_c + 1)
+        ]
+
+        blocks.append({
+            "range":        f"{index_to_col_letter(min_c)}{min_r + 1}:{index_to_col_letter(max_c)}{max_r + 1}",
+            "row_count":    max_r - min_r + 1,
+            "column_count": max_c - min_c + 1,
+            "header_names": header_names,
+        })
+
+    blocks.sort(key=lambda b: (int(b["range"].split(":")[0][1:] or 0), b["range"][0]))
+    return blocks
+
+
 def read_sheet_structure(service, spreadsheetId: str) -> dict:
     """
     Fetches all tab names and IDs, the used data range of each tab, named
-    ranges, and an actual formula count per tab
+    ranges, formula count per tab, and data blocks (connected components of
+    non-empty cells) with column_count, row_count, and header_names.
     Also used to check for tab name collisions before creating new sheets.
 
     Args:
@@ -18,16 +90,13 @@ def read_sheet_structure(service, spreadsheetId: str) -> dict:
     logger.info("read_sheet_structure request: %s", req)
 
     try:
-        # Fetch full grid data so we can count formula cells accurately.
-        # fields filter keeps the payload small by excluding effectiveValue /
-        # formattedValue — we only need userEnteredValue.formulaValue.
         meta = service.spreadsheets().get(
             spreadsheetId=spreadsheetId,
             includeGridData=True,
             fields=(
                 "spreadsheetId,"
                 "properties.title,"
-                "sheets(properties,data.rowData.values.userEnteredValue.formulaValue),"
+                "sheets(properties,data(startRow,startColumn,rowData.values.userEnteredValue)),"
                 "namedRanges"
             ),
         ).execute()
@@ -44,7 +113,6 @@ def read_sheet_structure(service, spreadsheetId: str) -> dict:
                 else "A1"
             )
 
-            # Count cells that actually contain a formula from the fetched grid data
             formula_count = 0
             for grid_data in sheet.get("data", []):
                 for row_data in grid_data.get("rowData", []):
@@ -58,6 +126,7 @@ def read_sheet_structure(service, spreadsheetId: str) -> dict:
                 "index":        props["index"],
                 "usedRange":    used_range,
                 "formulaCount": formula_count,
+                "dataBlocks":   _find_data_blocks(sheet),
             })
 
         sheets_map = {s["sheetId"]: s["title"] for s in sheets_summary}
