@@ -1,7 +1,40 @@
 import json
+import threading
 from typing import Any, Dict, List, Optional
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
+
+
+class SearchBudget:
+    """
+    Thread-safe per-invocation counter for search tool calls.
+    Each agent invocation resets the budget. Once exhausted, all search
+    tools return a budget-exhausted message so the agent proceeds with
+    information already gathered instead of continuing to search.
+    """
+    def __init__(self, limit: int = 5):
+        self.limit = limit
+        self._used = 0
+        self._lock = threading.Lock()
+
+    def reset(self, limit: int = None):
+        with self._lock:
+            self._used = 0
+            if limit is not None:
+                self.limit = limit
+
+    def consume(self) -> bool:
+        """Returns True and increments counter if budget remains. False if exhausted."""
+        with self._lock:
+            if self._used >= self.limit:
+                return False
+            self._used += 1
+            return True
+
+    @property
+    def remaining(self) -> int:
+        with self._lock:
+            return max(0, self.limit - self._used)
 
 from .cell_content.write_values import write_values
 from .read_structure.read_range import read_range
@@ -26,9 +59,14 @@ from .data_validation.data_validation import (
 from .formula_utils.audit_formulas import audit_formulas
 from .formula_utils.trace_dependents import trace_dependents
 from .sheet_structure.create_sheet import create_sheet
+from .sheet_structure.rename_sheet import rename_sheet
+from .sheet_structure.delete_sheet import delete_sheet
 from .common_tools.common_tools import (
     web_search,
     fetch_url,
+    fetch_filing_us,
+    fetch_filing_india,
+    web_search_financial,
     run_python,
     load_sheet_to_df,
     write_df_to_sheet,
@@ -206,13 +244,38 @@ class CreateSheetInput(BaseModel):
     tabColor: Optional[Dict[str, Any]] = None
     gridProperties: Optional[Dict[str, Any]] = None
 
+class RenameSheetInput(BaseModel):
+    spreadsheetId: str
+    sheetId: int
+    newTitle: str
+
+class DeleteSheetInput(BaseModel):
+    spreadsheetId: str
+    sheetId: int
+
 class WebSearchInput(BaseModel):
     query: str = Field(..., description="Search query string")
     num_results: int = Field(5, description="Maximum number of results to return")
 
 class FetchUrlInput(BaseModel):
     url: str = Field(..., description="Full URL to fetch (http/https). Supports HTML pages and PDF files.")
-    max_chars: int = Field(20000, description="Maximum characters of text to return")
+    max_chars: int = Field(4000, description="Maximum characters of text to return. Increase to 8000 for financial filings that need full content.")
+    extract_tables: bool = Field(True, description="For PDFs, also extract structured tables alongside the text")
+
+class FetchFilingUsInput(BaseModel):
+    ticker: str = Field(..., description="US stock ticker symbol (e.g. 'AAPL', 'MSFT', 'TSLA')")
+    form_type: str = Field("10-K", description="SEC form type: '10-K' (annual), '10-Q' (quarterly), '8-K' (material events), 'DEF 14A' (proxy), 'S-1' (IPO)")
+    limit: int = Field(1, description="How many recent filings of this form_type to fetch (default 1, keep small — each pulls a multi-MB doc)")
+
+class FetchFilingIndiaInput(BaseModel):
+    ticker: str = Field(..., description="BSE ticker symbol (e.g. 'RELIANCE', 'TCS', 'HDFCBANK') or numeric BSE scripcode")
+    year: Optional[int] = Field(None, description="Specific fiscal year to retrieve (e.g. 2023). Omit for the most recent annual report.")
+
+class WebSearchFinancialInput(BaseModel):
+    query: str = Field(..., description="Search query — e.g. 'Apple FY2023 revenue', 'Reliance segment results', 'TCS dividend history'")
+    region: str = Field("auto", description="'us' biases SEC/EDGAR; 'in' biases BSE/NSE/SEBI; 'auto' detects from query (default)")
+    num_results: int = Field(5, description="Maximum number of results to return")
+    prefer_pdf: bool = Field(True, description="Append 'filetype:pdf' to the query to bias toward downloadable filings")
 
 class RunPythonInput(BaseModel):
     code: str = Field(..., description="Python code to execute in the sandbox")
@@ -282,6 +345,8 @@ def create_write_tools(service) -> list:
         _wrap(set_data_validation, SetDataValidationInput, service),
         _wrap(clear_data_validation, ClearDataValidationInput, service),
         _wrap(create_sheet, CreateSheetInput, service),
+        _wrap(rename_sheet, RenameSheetInput, service),
+        _wrap(delete_sheet, DeleteSheetInput, service),
     ]
 
 
@@ -338,14 +403,48 @@ def create_python_tools(service) -> list:
     ]
 
 
-def create_research_tools() -> list:
-    """Web search and URL fetch tools. No Sheets service required."""
+def create_research_tools(budget: SearchBudget = None) -> list:
+    """Web search, URL fetch, and financial-filing tools. No Sheets service required."""
+
+    def _budget_check() -> Optional[str]:
+        """Returns an error JSON string if budget is exhausted, else None."""
+        if budget is not None and not budget.consume():
+            return json.dumps({
+                "success": False,
+                "error": (
+                    f"Search budget exhausted (limit: {budget.limit} searches per agent call). "
+                    "Proceed with the information already gathered — do not search further."
+                ),
+            })
+        return None
 
     def _web_search(query: str, num_results: int = 5):
+        err = _budget_check()
+        if err:
+            return err
         return json.dumps(web_search(query, num_results), default=str)
 
-    def _fetch_url(url: str, max_chars: int = 20000):
-        return json.dumps(fetch_url(url, max_chars), default=str)
+    def _fetch_url(url: str, max_chars: int = 8000, extract_tables: bool = True):
+        # fetch_url is not search — no budget check
+        return json.dumps(fetch_url(url, max_chars, extract_tables), default=str)
+
+    def _fetch_filing_us(ticker: str, form_type: str = "10-K", limit: int = 1):
+        err = _budget_check()
+        if err:
+            return err
+        return json.dumps(fetch_filing_us(ticker, form_type, limit), default=str)
+
+    def _fetch_filing_india(ticker: str, year: Optional[int] = None):
+        err = _budget_check()
+        if err:
+            return err
+        return json.dumps(fetch_filing_india(ticker, year), default=str)
+
+    def _web_search_financial(query: str, region: str = "auto", num_results: int = 5, prefer_pdf: bool = True):
+        err = _budget_check()
+        if err:
+            return err
+        return json.dumps(web_search_financial(query, region, num_results, prefer_pdf), default=str)
 
     return [
         StructuredTool.from_function(
@@ -359,5 +458,23 @@ def create_research_tools() -> list:
             name=fetch_url.__name__,
             description=fetch_url.__doc__ or fetch_url.__name__,
             args_schema=FetchUrlInput,
+        ),
+        StructuredTool.from_function(
+            func=_fetch_filing_us,
+            name=fetch_filing_us.__name__,
+            description=fetch_filing_us.__doc__ or fetch_filing_us.__name__,
+            args_schema=FetchFilingUsInput,
+        ),
+        StructuredTool.from_function(
+            func=_fetch_filing_india,
+            name=fetch_filing_india.__name__,
+            description=fetch_filing_india.__doc__ or fetch_filing_india.__name__,
+            args_schema=FetchFilingIndiaInput,
+        ),
+        StructuredTool.from_function(
+            func=_web_search_financial,
+            name=web_search_financial.__name__,
+            description=web_search_financial.__doc__ or web_search_financial.__name__,
+            args_schema=WebSearchFinancialInput,
         ),
     ]

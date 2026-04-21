@@ -1,12 +1,112 @@
+import logging
 import os
-from langchain.agents import create_tool_calling_agent, AgentExecutor
+import time
+
+from langchain.agents import AgentExecutor
+from langchain.agents.format_scratchpad.tools import format_to_tool_messages
+from langchain.agents.output_parsers.tools import ToolsAgentOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 
 from .llmFactory import get_llm
-from tools.langchain_tools import create_read_tools, create_research_tools
+from tools.langchain_tools import (
+    SearchBudget,
+    create_read_tools,
+    create_research_tools,
+    create_write_tools,
+    create_python_tools,
+)
 from tools.utils import build_sheets_service
 from utils import load_access_token_from_file
-from tools.langchain_tools import create_read_tools, create_research_tools, create_write_tools, create_python_tools
+
+logger = logging.getLogger(__name__)
+
+_TASK_CONTEXT_BLOCK = "\n\n## Current Task Context\n{task_context}"
+
+# Retry config for per-LLM-call backoff (scratchpad is preserved between retries)
+_LLM_RETRY_MAX    = 6
+_LLM_RETRY_BASE_S = 15   # doubles each attempt, capped at 120s
+
+
+def _is_rate_limit(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return "rate_limit" in s or "rate limit" in s or "429" in s or "too many requests" in s
+
+
+def _make_retrying_llm(bound_llm):
+    """
+    Wrap a bound LLM runnable so that rate-limit errors on individual LLM calls
+    are retried with exponential backoff. The AgentExecutor's scratchpad is NOT
+    part of this call — it lives in the AgentExecutor loop — so retrying here
+    preserves all accumulated research context.
+    """
+    def _invoke(input, config=None):
+        delay = _LLM_RETRY_BASE_S
+        for attempt in range(1, _LLM_RETRY_MAX + 1):
+            try:
+                return bound_llm.invoke(input, config=config)
+            except Exception as e:
+                if not _is_rate_limit(e) or attempt == _LLM_RETRY_MAX:
+                    raise
+                logger.warning(
+                    "LLM rate limit (attempt %d/%d). Backing off %ds. Error: %s",
+                    attempt, _LLM_RETRY_MAX, delay, e,
+                )
+                time.sleep(delay)
+                delay = min(delay * 2, 120)
+
+    return RunnableLambda(_invoke)
+
+
+# Scratchpad compaction settings
+_SCRATCHPAD_FULL_STEPS   = 4    # keep the last N steps at full detail
+_SCRATCHPAD_OLD_OUT_CHARS = 250  # max chars kept for older tool outputs
+
+
+def _compact_scratchpad(intermediate_steps: list) -> list:
+    """
+    Convert intermediate_steps → tool messages with bounded token growth.
+
+    The last _SCRATCHPAD_FULL_STEPS steps are kept at full detail (the model
+    needs recent context). Older steps have their tool output truncated to
+    _SCRATCHPAD_OLD_OUT_CHARS chars — the model can still see it called the
+    tool and what it roughly got, without re-reading the full response.
+    """
+    if not intermediate_steps:
+        return []
+
+    cutoff = max(0, len(intermediate_steps) - _SCRATCHPAD_FULL_STEPS)
+    compacted = []
+    for i, (action, output) in enumerate(intermediate_steps):
+        if i < cutoff:
+            out_str = str(output)
+            if len(out_str) > _SCRATCHPAD_OLD_OUT_CHARS:
+                output = (
+                    out_str[:_SCRATCHPAD_OLD_OUT_CHARS]
+                    + f" … [truncated, {len(out_str)} chars total]"
+                )
+        compacted.append((action, output))
+
+    return format_to_tool_messages(compacted)
+
+
+def _build_agent(llm, tools, prompt):
+    """
+    Replaces create_tool_calling_agent. Inserts:
+    - Per-LLM-call retry for rate limits (preserves scratchpad between retries)
+    - Scratchpad compaction (truncates old tool outputs to bound token growth)
+    """
+    bound_llm    = llm.bind_tools(tools)
+    retrying_llm = _make_retrying_llm(bound_llm)
+
+    return (
+        RunnablePassthrough.assign(
+            agent_scratchpad=lambda x: _compact_scratchpad(x["intermediate_steps"])
+        )
+        | prompt
+        | retrying_llm
+        | ToolsAgentOutputParser()
+    )
 
 
 class LLMAgents:
@@ -17,132 +117,85 @@ class LLMAgents:
         self.access_token = load_access_token_from_file()
         self.sheet_service = build_sheets_service(self.access_token)
 
-        self.research_tools = create_research_tools()
-        self.read_tools = create_read_tools(self.sheet_service)
-        self.write_tools = create_write_tools(self.sheet_service)
-        self.python_tools = create_python_tools(self.sheet_service)
+        self.search_budget     = SearchBudget(limit=5)
+        self.research_tools    = create_research_tools(budget=self.search_budget)
+        self.read_tools        = create_read_tools(self.sheet_service)
+        self.write_tools       = create_write_tools(self.sheet_service)
+        self.python_tools      = create_python_tools(self.sheet_service)
 
-        self.planner_tools = self.research_tools + self.read_tools
-        self.execution_tools = self.write_tools + self.read_tools + self.python_tools + self.research_tools
+        self.planner_tools     = self.research_tools + self.read_tools
+        self.replanner_tools   = self.research_tools + self.read_tools
+        self.execution_tools   = self.write_tools + self.read_tools + self.python_tools + self.research_tools
         self.verification_tools = self.read_tools + self.python_tools
-        self.compaction_tools = []
-        self.basic_tools = []
-        self.generic_tools = self.read_tools + self.write_tools + self.python_tools + self.research_tools
+        self.basic_tools       = []
+        self.generic_tools     = self.read_tools + self.write_tools + self.python_tools + self.research_tools
 
-        self.planner_prompt_path = os.path.join(os.path.dirname(__file__), "prompts", "planner.txt")
-        self.replanner_prompt_path = os.path.join(os.path.dirname(__file__), "prompts", "replanner.txt")
-        self.researcher_prompt_path = os.path.join(os.path.dirname(__file__), "prompts", "researcher.txt")
-        self.verifier_prompt_path = os.path.join(os.path.dirname(__file__), "prompts", "verifier.txt")
-        self.execution_prompt_path = os.path.join(os.path.dirname(__file__), "prompts", "execution.txt")
-        self.generic_prompt_path = os.path.join(os.path.dirname(__file__), "prompts", "generic.txt")
+        prompts_dir = os.path.join(os.path.dirname(__file__), "prompts")
 
-        with open(self.planner_prompt_path, "r", encoding="utf-8") as f:
-            self.planner_prompt = f.read().strip()
-        with open(self.replanner_prompt_path, "r", encoding="utf-8") as f:
-            self.replanner_prompt = f.read().strip()
-        with open(self.researcher_prompt_path, "r", encoding="utf-8") as f:
-            self.researcher_prompt = f.read().strip()
-        with open(self.verifier_prompt_path, "r", encoding="utf-8") as f:
-            self.verifier_prompt = f.read().strip()
-        with open(self.execution_prompt_path, "r", encoding="utf-8") as f:
-            self.execution_prompt = f.read().strip()
-        with open(self.generic_prompt_path, "r", encoding="utf-8") as f:
-            self.generic_prompt = f.read().strip()
+        def _load(name):
+            with open(os.path.join(prompts_dir, name), "r", encoding="utf-8") as f:
+                return f.read().strip()
 
-        self.plannerPromptTemplate = ChatPromptTemplate.from_messages([
-            MessagePlaceholder(variable_name="task_context", optional=True),
-            ("system", self.planner_prompt),
-            MessagesPlaceholder(variable_name="chat_history", optional=True),
-            ("user", "{input}"),
-            MessagesPlaceholder(variable_name="agent_scratchpad"),
-        ])
-        self.replannerPromptTemplate = ChatPromptTemplate.from_messages([
-            MessagePlaceholder(variable_name="task_context", optional=True),
-            ("system", self.replanner_prompt),
-            MessagesPlaceholder(variable_name="chat_history", optional=True),
-            ("user", "{input}"),
-            MessagesPlaceholder(variable_name="agent_scratchpad"),
-        ])
-        self.researcherPromptTemplate = ChatPromptTemplate.from_messages([
-            MessagePlaceholder(variable_name="task_context", optional=True),
-            ("system", self.researcher_prompt),
-            MessagesPlaceholder(variable_name="chat_history", optional=True),
-            ("user", "{input}"),
-            MessagesPlaceholder(variable_name="agent_scratchpad"),
-        ])
-        self.verifierPromptTemplate = ChatPromptTemplate.from_messages([
-            MessagePlaceholder(variable_name="task_context", optional=True),
-            ("system", self.verifier_prompt),
-            MessagesPlaceholder(variable_name="chat_history", optional=True),
-            ("user", "{input}"),
-            MessagesPlaceholder(variable_name="agent_scratchpad"),
-        ])
-        self.executionPromptTemplate = ChatPromptTemplate.from_messages([
-            MessagePlaceholder(variable_name="task_context", optional=True),
-            ("system", self.execution_prompt),
-            MessagesPlaceholder(variable_name="chat_history", optional=True),
-            ("user", "{input}"),
-            MessagesPlaceholder(variable_name="agent_scratchpad"),
-        ])
-        self.genericPromptTemplate = ChatPromptTemplate.from_messages([
-            MessagePlaceholder(variable_name="task_context", optional=True),
-            ("system", self.generic_prompt),
-            MessagesPlaceholder(variable_name="chat_history", optional=True),
-            ("user", "{input}"),
-            MessagesPlaceholder(variable_name="agent_scratchpad"),
-        ])
-        self.basicPromptTemplate = ChatPromptTemplate.from_messages([
-            MessagePlaceholder(variable_name="task_context", optional=True),
-            ("system", "{system_prompt}"),
+        self.plannerPromptTemplate   = self._build_template(_load("planner.txt"))
+        self.replannerPromptTemplate = self._build_template(_load("replanner.txt"))
+        self.researcherPromptTemplate = self._build_template(_load("researcher.txt"))
+        self.verifierPromptTemplate  = self._build_template(_load("verifier.txt"))
+        self.executionPromptTemplate = self._build_template(_load("execution.txt"))
+        self.genericPromptTemplate   = self._build_template(_load("generic.txt"))
+        self.basicPromptTemplate     = ChatPromptTemplate.from_messages([
+            ("system", "{system_prompt}" + _TASK_CONTEXT_BLOCK),
             MessagesPlaceholder(variable_name="chat_history", optional=True),
             ("user", "{input}"),
             MessagesPlaceholder(variable_name="agent_scratchpad"),
         ])
 
-        self.plannerAgent = create_tool_calling_agent(self.llm, self.planner_tools, self.plannerPromptTemplate)
-        self.replannerAgent = create_tool_calling_agent(self.llm, self.replanner_tools, self.replannerPromptTemplate)
-        self.researcherAgent = create_tool_calling_agent(self.llm, self.research_tools, self.researcherPromptTemplate)
-        self.verifierAgent = create_tool_calling_agent(self.llm, self.verification_tools, self.verifierPromptTemplate)
-        self.executionAgent = create_tool_calling_agent(self.llm, self.execution_tools, self.executionPromptTemplate)
-        self.genericAgent = create_tool_calling_agent(self.llm, self.generic_tools, self.genericPromptTemplate)
-        self.basicAgent = create_tool_calling_agent(self.llm, self.basic_tools, self.basicPromptTemplate)
+        self.plannerAgent    = _build_agent(self.llm, self.planner_tools,      self.plannerPromptTemplate)
+        self.replannerAgent  = _build_agent(self.llm, self.replanner_tools,    self.replannerPromptTemplate)
+        self.researcherAgent = _build_agent(self.llm, self.research_tools,     self.researcherPromptTemplate)
+        self.verifierAgent   = _build_agent(self.llm, self.verification_tools, self.verifierPromptTemplate)
+        self.executionAgent  = _build_agent(self.llm, self.execution_tools,    self.executionPromptTemplate)
+        self.genericAgent    = _build_agent(self.llm, self.generic_tools,      self.genericPromptTemplate)
+        self.basicAgent      = _build_agent(self.llm, self.basic_tools,        self.basicPromptTemplate)
 
-pro_llmAgents = LLMAgents("pro")
-fast_llmAgents = LLMAgents("fast")
+    @staticmethod
+    def _build_template(system_prompt: str) -> ChatPromptTemplate:
+        # Escape literal braces so LangChain doesn't treat JSON examples as
+        # template variables. _TASK_CONTEXT_BLOCK is appended after escaping
+        # so {task_context} stays as a real variable.
+        escaped = system_prompt.replace("{", "{{").replace("}", "}}")
+        return ChatPromptTemplate.from_messages([
+            ("system", escaped + _TASK_CONTEXT_BLOCK),
+            MessagesPlaceholder(variable_name="chat_history", optional=True),
+            ("user", "{input}"),
+            MessagesPlaceholder(variable_name="agent_scratchpad"),
+        ])
+
+
 
 def getAgent(agentType: str, llm_type: str = "fast"):
-    """
-    Factory function to create and return Langchain tool-calling agents.
-    
-    Args:
-        agentType (str): The type of agent to create (e.g., "plannerAgent").
-        access_token (str, optional): The OAuth token for Google Sheets API.
-                                      Required to initialize read_tools.
-                                      
-    Returns:
-        AgentExecutor: The initialized Langchain agent executor.
-    """
+    """Factory: return a configured AgentExecutor for the requested agent type."""
+    pro_llmAgents  = LLMAgents("pro")
+    fast_llmAgents = LLMAgents("fast")
 
-    llmAgents = None
+    llmAgents = pro_llmAgents if llm_type == "pro" else fast_llmAgents
 
-    if llm_type == "pro":
-        llmAgents = pro_llmAgents
-    else:
-        llmAgents = fast_llmAgents
+    # (agent, tools, max_iterations, search_budget_limit)
+    # search_budget_limit=0 means no search tools — budget reset is a no-op
+    agents = {
+        "planner":    (llmAgents.plannerAgent,    llmAgents.planner_tools,      50, 6),
+        "replanner":  (llmAgents.replannerAgent,  llmAgents.replanner_tools,    50, 4),
+        "researcher": (llmAgents.researcherAgent, llmAgents.research_tools,     50, 8),
+        "verifier":   (llmAgents.verifierAgent,   llmAgents.verification_tools, 50, 0),
+        "execution":  (llmAgents.executionAgent,  llmAgents.execution_tools,    60, 3),
+        "generic":    (llmAgents.genericAgent,    llmAgents.generic_tools,      50, 5),
+        "basic":      (llmAgents.basicAgent,      llmAgents.basic_tools,         5, 0),
+    }
 
-    if agentType == "planner":
-        return AgentExecutor(agent=llmAgents.plannerAgent, tools=llmAgents.planner_tools,max_iterations=30, verbose=True)
-    if agentType == "replanner":
-        return AgentExecutor(agent=llmAgents.replannerAgent, tools=llmAgents.replanner_tools,max_iterations=30, verbose=True)
-    if agentType == "researcher":
-        return AgentExecutor(agent=llmAgents.researcherAgent, tools=llmAgents.research_tools,max_iterations=30, verbose=True)
-    if agentType == "verifier":
-        return AgentExecutor(agent=llmAgents.verifierAgent, tools=llmAgents.verification_tools,max_iterations=30, verbose=True)
-    if agentType == "execution":
-        return AgentExecutor(agent=llmAgents.executionAgent, tools=llmAgents.execution_tools,max_iterations=30, verbose=True)
-    if agentType == "generic":
-        return AgentExecutor(agent=llmAgents.genericAgent, tools=llmAgents.generic_tools,max_iterations=5, verbose=True)
-    if agentType == "basic":
-        return AgentExecutor(agent=llmAgents.basicAgent, tools=llmAgents.basic_tools,max_iterations=5, verbose=True)
+    if agentType not in agents:
+        raise ValueError(f"Unknown agentType: {agentType}")
 
-    raise ValueError(f"Unknown agentType: {agentType}")
+    agent, tools, max_iter, search_limit = agents[agentType]
+    if search_limit > 0:
+        llmAgents.search_budget.reset(limit=search_limit)
+
+    return AgentExecutor(agent=agent, tools=tools, max_iterations=max_iter, verbose=True)

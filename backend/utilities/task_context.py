@@ -21,5 +21,5 @@ class TaskContext:
     
     # Loop control
     current_iteration: int = 0
-    max_iteration: int = 5
+    max_iteration: int = 50
     status: str = "completed"  # planning | awaiting_clarification | executing | verifying | completed | replanning | failed

@@ -23,7 +23,11 @@ def add_conditional_format(
     Args:
         spreadsheetId: The ID of the target spreadsheet.
         sheetId: Numeric sheet ID of the tab to add the rule to.
-        ranges: List of A1 notation ranges the rule applies to.
+        ranges: List of ranges the rule applies to. Each element may be either
+                an A1 notation string (e.g. 'Sheet1!B5:F13') OR a pre-built
+                GridRange dict (e.g. {'startRowIndex': 4, 'endRowIndex': 13,
+                'startColumnIndex': 1, 'endColumnIndex': 6}).
+                sheetId is injected automatically if omitted from a dict.
         ruleType: 'COLOR_SCALE', 'CUSTOM_FORMULA', or 'TEXT_CONTAINS'.
         minColor: RGB color for minimum value (COLOR_SCALE only).
         midColor: RGB color for midpoint (COLOR_SCALE only). Omit for no midpoint.
@@ -43,7 +47,16 @@ def add_conditional_format(
     logger.info("add_conditional_format request: %s", req)
 
     try:
-        grid_ranges = [a1_to_grid_range(r, sheetId) for r in ranges]
+        def _to_grid_range(r):
+            # Accept both A1 strings ("Sheet1!A1:B5") and pre-built GridRange dicts.
+            if isinstance(r, dict):
+                # Ensure sheetId is set; caller may have omitted it.
+                gr = dict(r)
+                gr.setdefault("sheetId", sheetId)
+                return gr
+            return a1_to_grid_range(r, sheetId)
+
+        grid_ranges = [_to_grid_range(r) for r in ranges]
 
         if ruleType == "COLOR_SCALE":
             gradient_rule = {

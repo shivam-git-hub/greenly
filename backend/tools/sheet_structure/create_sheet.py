@@ -14,7 +14,7 @@ def create_sheet(
 ) -> dict:
     """
     Add a new tab to the workbook at the specified position.
-    Returns the numeric sheetId assigned by the Sheets API
+    Returns the numeric sheetId assigned by the Sheets API.
 
     Args:
         spreadsheetId: The ID of the target spreadsheet.
