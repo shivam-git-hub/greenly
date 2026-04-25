@@ -1,8 +1,11 @@
 import json
+import logging
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from langchain_core.tools import StructuredTool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+logger = logging.getLogger(__name__)
 
 
 class SearchBudget:
@@ -82,6 +85,21 @@ class WriteValuesInput(BaseModel):
     values: List[List[Any]]
     valueInputOption: str = "USER_ENTERED"
 
+    @field_validator("values", mode="before")
+    @classmethod
+    def _coerce_values(cls, v):
+        if isinstance(v, str):
+            import ast
+            # Try JSON first (double-quoted), then Python literal (single-quoted)
+            for loader in (json.loads, ast.literal_eval):
+                try:
+                    parsed = loader(v)
+                    if isinstance(parsed, list):
+                        return parsed
+                except Exception:
+                    continue
+        return v
+
 class ValidateFormulaInput(BaseModel):
     formula: str
     targetCell: str
@@ -134,7 +152,7 @@ class GetCellFormatInput(BaseModel):
 class AddConditionalFormatInput(BaseModel):
     spreadsheetId: str
     sheetId: int
-    ranges: List[Dict[str, Any]]
+    ranges: List[Union[Dict[str, Any], str]]
     ruleType: str
     minColor: Optional[Dict[str, Any]] = None
     midColor: Optional[Dict[str, Any]] = None
@@ -298,14 +316,32 @@ class WriteDfToSheetInput(BaseModel):
 
 # ── Shared helper ──────────────────────────────────────────────────────────────
 
+_SKIP_HINT = "If this error persists after correcting the parameters, skip this step and continue with the next one."
+
 def _wrap(fn, schema, service):
     def runner(**kwargs):
-        return json.dumps(fn(service, **kwargs), default=str)
+        try:
+            result = fn(service, **kwargs)
+            # Inject skip hint into error responses from the underlying function
+            if isinstance(result, dict) and not result.get("success", True) and "error" in result:
+                result = dict(result)
+                err = str(result["error"])
+                result["error"] = err[:400] + (" …" if len(err) > 400 else "")
+                result["hint"] = _SKIP_HINT
+            return json.dumps(result, default=str)
+        except Exception as e:
+            logger.warning("Tool %s raised: %s", fn.__name__, e)
+            return json.dumps({
+                "success": False,
+                "error": f"{type(e).__name__}: {str(e)[:300]}",
+                "hint": _SKIP_HINT,
+            })
     return StructuredTool.from_function(
         func=runner,
         name=fn.__name__,
         description=fn.__doc__ or fn.__name__,
         args_schema=schema,
+        handle_tool_error=True,
     )
 
 
@@ -355,7 +391,11 @@ def create_python_tools(service) -> list:
     ns = _make_sandbox_namespace()
 
     def _run_python(code: str, timeout: int = 30):
-        return json.dumps(run_python(code, timeout, _ns=ns), default=str)
+        try:
+            return json.dumps(run_python(code, timeout, _ns=ns), default=str)
+        except Exception as e:
+            logger.warning("run_python raised: %s", e)
+            return json.dumps({"success": False, "error": f"{type(e).__name__}: {str(e)[:300]}", "hint": _SKIP_HINT})
 
     def _load_sheet_to_df(
         spreadsheetId: str,
@@ -365,10 +405,14 @@ def create_python_tools(service) -> list:
         range: Optional[str] = None,
         hasHeader: bool = True,
     ):
-        return json.dumps(
-            load_sheet_to_df(service, spreadsheetId, sheetTitle, columns, varName, range, hasHeader, _ns=ns),
-            default=str,
-        )
+        try:
+            return json.dumps(
+                load_sheet_to_df(service, spreadsheetId, sheetTitle, columns, varName, range, hasHeader, _ns=ns),
+                default=str,
+            )
+        except Exception as e:
+            logger.warning("load_sheet_to_df raised: %s", e)
+            return json.dumps({"success": False, "error": f"{type(e).__name__}: {str(e)[:300]}", "hint": _SKIP_HINT})
 
     def _write_df_to_sheet(
         spreadsheetId: str,
@@ -376,10 +420,14 @@ def create_python_tools(service) -> list:
         varName: str = "df",
         includeHeader: bool = True,
     ):
-        return json.dumps(
-            write_df_to_sheet(service, spreadsheetId, range, varName, includeHeader, _ns=ns),
-            default=str,
-        )
+        try:
+            return json.dumps(
+                write_df_to_sheet(service, spreadsheetId, range, varName, includeHeader, _ns=ns),
+                default=str,
+            )
+        except Exception as e:
+            logger.warning("write_df_to_sheet raised: %s", e)
+            return json.dumps({"success": False, "error": f"{type(e).__name__}: {str(e)[:300]}", "hint": _SKIP_HINT})
 
     return [
         StructuredTool.from_function(
@@ -387,18 +435,21 @@ def create_python_tools(service) -> list:
             name=run_python.__name__,
             description=run_python.__doc__ or run_python.__name__,
             args_schema=RunPythonInput,
+            handle_tool_error=True,
         ),
         StructuredTool.from_function(
             func=_load_sheet_to_df,
             name=load_sheet_to_df.__name__,
             description=load_sheet_to_df.__doc__ or load_sheet_to_df.__name__,
             args_schema=LoadSheetToDfInput,
+            handle_tool_error=True,
         ),
         StructuredTool.from_function(
             func=_write_df_to_sheet,
             name=write_df_to_sheet.__name__,
             description=write_df_to_sheet.__doc__ or write_df_to_sheet.__name__,
             args_schema=WriteDfToSheetInput,
+            handle_tool_error=True,
         ),
     ]
 
@@ -418,33 +469,43 @@ def create_research_tools(budget: SearchBudget = None) -> list:
             })
         return None
 
+    def _safe_run(name, fn, *args, **kwargs):
+        try:
+            return json.dumps(fn(*args, **kwargs), default=str)
+        except Exception as e:
+            logger.warning("Research tool %s raised: %s", name, e)
+            return json.dumps({
+                "success": False,
+                "error": f"{type(e).__name__}: {str(e)[:300]}",
+                "hint": _SKIP_HINT,
+            })
+
     def _web_search(query: str, num_results: int = 5):
         err = _budget_check()
         if err:
             return err
-        return json.dumps(web_search(query, num_results), default=str)
+        return _safe_run("web_search", web_search, query, num_results)
 
     def _fetch_url(url: str, max_chars: int = 8000, extract_tables: bool = True):
-        # fetch_url is not search — no budget check
-        return json.dumps(fetch_url(url, max_chars, extract_tables), default=str)
+        return _safe_run("fetch_url", fetch_url, url, max_chars, extract_tables)
 
     def _fetch_filing_us(ticker: str, form_type: str = "10-K", limit: int = 1):
         err = _budget_check()
         if err:
             return err
-        return json.dumps(fetch_filing_us(ticker, form_type, limit), default=str)
+        return _safe_run("fetch_filing_us", fetch_filing_us, ticker, form_type, limit)
 
     def _fetch_filing_india(ticker: str, year: Optional[int] = None):
         err = _budget_check()
         if err:
             return err
-        return json.dumps(fetch_filing_india(ticker, year), default=str)
+        return _safe_run("fetch_filing_india", fetch_filing_india, ticker, year)
 
     def _web_search_financial(query: str, region: str = "auto", num_results: int = 5, prefer_pdf: bool = True):
         err = _budget_check()
         if err:
             return err
-        return json.dumps(web_search_financial(query, region, num_results, prefer_pdf), default=str)
+        return _safe_run("web_search_financial", web_search_financial, query, region, num_results, prefer_pdf)
 
     return [
         StructuredTool.from_function(
@@ -452,29 +513,34 @@ def create_research_tools(budget: SearchBudget = None) -> list:
             name=web_search.__name__,
             description=web_search.__doc__ or web_search.__name__,
             args_schema=WebSearchInput,
+            handle_tool_error=True,
         ),
         StructuredTool.from_function(
             func=_fetch_url,
             name=fetch_url.__name__,
             description=fetch_url.__doc__ or fetch_url.__name__,
             args_schema=FetchUrlInput,
+            handle_tool_error=True,
         ),
         StructuredTool.from_function(
             func=_fetch_filing_us,
             name=fetch_filing_us.__name__,
             description=fetch_filing_us.__doc__ or fetch_filing_us.__name__,
             args_schema=FetchFilingUsInput,
+            handle_tool_error=True,
         ),
         StructuredTool.from_function(
             func=_fetch_filing_india,
             name=fetch_filing_india.__name__,
             description=fetch_filing_india.__doc__ or fetch_filing_india.__name__,
             args_schema=FetchFilingIndiaInput,
+            handle_tool_error=True,
         ),
         StructuredTool.from_function(
             func=_web_search_financial,
             name=web_search_financial.__name__,
             description=web_search_financial.__doc__ or web_search_financial.__name__,
             args_schema=WebSearchFinancialInput,
+            handle_tool_error=True,
         ),
     ]

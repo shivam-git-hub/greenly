@@ -24,6 +24,22 @@ Each state invokes a dedicated LangChain agent built in `llm/agentFactory.py`:
 
 `task_context` (a `TaskContext` dataclass from `utilities/task_context.py`) is JSON-serialized and embedded in each agent's system prompt under `## Current Task Context`.
 
+### Anthropic prompt caching (agentFactory.py)
+
+When `LLM_PROVIDER=anthropic`, `_build_template` renders `system` as two content blocks — `[static_prompt, task_context]` — and a `RunnableLambda` (`_apply_anthropic_cache`) inserted between `prompt` and the LLM marks block 0 with `cache_control: ephemeral` plus a second marker on the last user message. This gives two breakpoints:
+
+1. `[tools + static_prompt]` — persists across every invocation of the same agent regardless of `task_context` / history / input.
+2. `[tools + system + history + user input]` — within a single `agent.invoke()` only the scratchpad changes between tool calls, so every LLM call after the first in the loop reads this entire prefix from cache (~0.1× cost).
+
+Invariants to preserve — breaking any of these silently invalidates the cache:
+
+- Nothing volatile (timestamps, UUIDs, per-request IDs) in the static system block or in the tool schemas. Keep `task_context` in block 1 only.
+- Tool order and tool schemas must be deterministic per agent (same `create_*_tools(...)` output across invocations).
+- Don't collapse the two-block system back into one string — `_apply_anthropic_cache` depends on block 0 being the static half.
+- The transform is gated on `LLM_PROVIDER=anthropic`; for Gemini the template falls back to a single-string system and the LLM call is unchanged.
+
+Verify caching is working via `response.usage.cache_read_input_tokens` / `cache_creation_input_tokens` on LangChain's AIMessage `response_metadata` — if both stay zero across repeated requests, something in the prefix is drifting.
+
 ## Tools
 
 Tools are wired in `tools/langchain_tools.py` via `create_read_tools`, `create_write_tools`, `create_python_tools`, `create_research_tools`. Sheet-mutating tools live under `tools/<feature>/`.
