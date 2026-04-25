@@ -73,6 +73,7 @@ from .common_tools.common_tools import (
     run_python,
     load_sheet_to_df,
     write_df_to_sheet,
+    load_skill,
     _make_sandbox_namespace,
 )
 
@@ -271,13 +272,16 @@ class DeleteSheetInput(BaseModel):
     spreadsheetId: str
     sheetId: int
 
+class LoadSkillInput(BaseModel):
+    skill_name: str = Field(..., description="Name of the skill to load (e.g. 'DCF'). Call with an empty string or a nonexistent name to get the list of available skills.")
+
 class WebSearchInput(BaseModel):
     query: str = Field(..., description="Search query string")
     num_results: int = Field(5, description="Maximum number of results to return")
 
 class FetchUrlInput(BaseModel):
     url: str = Field(..., description="Full URL to fetch (http/https). Supports HTML pages and PDF files.")
-    max_chars: int = Field(4000, description="Maximum characters of text to return. Increase to 8000 for financial filings that need full content.")
+    max_chars: int = Field(8000, description="Maximum characters of text to return. Increase to 16000 for financial filings that need full content.")
     extract_tables: bool = Field(True, description="For PDFs, also extract structured tables alongside the text")
 
 class FetchFilingUsInput(BaseModel):
@@ -454,6 +458,27 @@ def create_python_tools(service) -> list:
     ]
 
 
+def create_skill_tools() -> list:
+    """Local skill-documentation loader. No external calls or Sheets service required."""
+
+    def _load_skill(skill_name: str):
+        try:
+            return json.dumps(load_skill(skill_name), default=str)
+        except Exception as e:
+            logger.warning("load_skill raised: %s", e)
+            return json.dumps({"success": False, "error": f"{type(e).__name__}: {str(e)[:300]}"})
+
+    return [
+        StructuredTool.from_function(
+            func=_load_skill,
+            name=load_skill.__name__,
+            description=load_skill.__doc__ or load_skill.__name__,
+            args_schema=LoadSkillInput,
+            handle_tool_error=True,
+        ),
+    ]
+
+
 def create_research_tools(budget: SearchBudget = None) -> list:
     """Web search, URL fetch, and financial-filing tools. No Sheets service required."""
 
@@ -487,6 +512,9 @@ def create_research_tools(budget: SearchBudget = None) -> list:
         return _safe_run("web_search", web_search, query, num_results)
 
     def _fetch_url(url: str, max_chars: int = 8000, extract_tables: bool = True):
+        err = _budget_check()
+        if err:
+            return err
         return _safe_run("fetch_url", fetch_url, url, max_chars, extract_tables)
 
     def _fetch_filing_us(ticker: str, form_type: str = "10-K", limit: int = 1):

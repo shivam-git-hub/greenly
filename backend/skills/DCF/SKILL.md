@@ -1,5 +1,7 @@
 # DCF Model Skill
 
+> Builds a professional-grade DCF model in Google Sheets — historical inputs, revenue projections, WACC, terminal value, sensitivity analysis, and equity bridge.
+
 A step-by-step guide for building a professional-grade Discounted Cash Flow (DCF) model in Google Sheets. Follow every section in order. Never skip clarifications. Never hard-code assumptions inside formula cells.
 
 ---

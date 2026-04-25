@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import time
@@ -13,12 +14,15 @@ from langchain_core.prompts import (
     SystemMessagePromptTemplate,
 )
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough
+from langchain_core.tools import StructuredTool
+from pydantic import BaseModel, Field
 
 from .llmFactory import get_llm
 from tools.langchain_tools import (
     SearchBudget,
     create_read_tools,
     create_research_tools,
+    create_skill_tools,
     create_write_tools,
     create_python_tools,
 )
@@ -32,8 +36,34 @@ _LLM_RETRY_MAX    = 6
 _LLM_RETRY_BASE_S = 15   # doubles each attempt, capped at 120s
 
 # Scratchpad compaction settings
-_SCRATCHPAD_FULL_STEPS    = 4    # keep the last N steps at full detail
-_SCRATCHPAD_OLD_OUT_CHARS = 250  # max chars kept for older tool outputs
+_SCRATCHPAD_FULL_STEPS        = 4       # keep the last N steps at full detail
+_SCRATCHPAD_CHAR_BUDGET       = 20_000  # only compact when total output exceeds this
+_SCRATCHPAD_OLD_READ_CHARS    = 600     # budget for old read-tool outputs
+_SCRATCHPAD_OLD_WRITE_CHARS   = 80      # budget for old write-tool outputs (usually {"success": true})
+_SCRATCHPAD_OLD_DEFAULT_CHARS = 500     # budget for everything else
+
+# Tool sets for per-type truncation budgets.
+# Research and Python tools are kept full — their outputs are already compact
+# or contain structure that breaks when cut mid-way.
+_TOOLS_KEEP_FULL = frozenset({
+    "web_search", "web_search_financial", "fetch_url",
+    "fetch_filing_us", "fetch_filing_india", "load_skill",
+    "run_python", "load_sheet_to_df", "write_df_to_sheet",
+})
+_TOOLS_READ = frozenset({
+    "read_sheet_structure", "read_range", "get_chunk",
+    "audit_formulas", "trace_dependents",
+})
+_TOOLS_WRITE = frozenset({
+    "write_values", "apply_cell_format", "add_conditional_format",
+    "create_chart", "create_pivot_table", "set_data_validation",
+    "create_named_range", "create_sheet",
+})
+
+# Search budget for the researcher sub-agent (called via the `research` tool).
+# This is the effective limit — the search_limit column in getAgent is irrelevant
+# for agents that use researcher_tool instead of raw search tools.
+_RESEARCHER_SEARCH_LIMIT = 20
 
 # Prompt caching is an Anthropic-only feature. langchain-anthropic forwards
 # `cache_control` blocks in message content through to the Messages API.
@@ -72,28 +102,52 @@ def _make_retrying_llm(bound_llm):
     return RunnableLambda(_invoke)
 
 
+def _tool_char_budget(tool_name: str) -> int | None:
+    """Return the char budget for an old step's output, or None to keep full."""
+    if tool_name in _TOOLS_KEEP_FULL:
+        return None
+    if tool_name in _TOOLS_READ:
+        return _SCRATCHPAD_OLD_READ_CHARS
+    if tool_name in _TOOLS_WRITE:
+        return _SCRATCHPAD_OLD_WRITE_CHARS
+    return _SCRATCHPAD_OLD_DEFAULT_CHARS
+
+
 def _compact_scratchpad(intermediate_steps: list) -> list:
     """
     Convert intermediate_steps → tool messages with bounded token growth.
 
-    The last _SCRATCHPAD_FULL_STEPS steps are kept at full detail (the model
-    needs recent context). Older steps have their tool output truncated to
-    _SCRATCHPAD_OLD_OUT_CHARS chars — the model can still see it called the
-    tool and what it roughly got, without re-reading the full response.
+    Compaction is skipped entirely when:
+    - There are no steps beyond the full window, OR
+    - Total output chars are under _SCRATCHPAD_CHAR_BUDGET.
+
+    When triggered, the last _SCRATCHPAD_FULL_STEPS steps are kept at full
+    detail. Older steps are truncated per tool type:
+    - Research + Python tools: always full (structure breaks when cut)
+    - Read tools: up to _SCRATCHPAD_OLD_READ_CHARS
+    - Write tools: up to _SCRATCHPAD_OLD_WRITE_CHARS (usually just success flag)
+    - Everything else: up to _SCRATCHPAD_OLD_DEFAULT_CHARS
+    - Error outputs: always full regardless of tool or age
     """
     if not intermediate_steps:
         return []
+
+    if len(intermediate_steps) <= _SCRATCHPAD_FULL_STEPS:
+        return format_to_tool_messages(intermediate_steps)
+
+    total_chars = sum(len(str(output)) for _, output in intermediate_steps)
+    if total_chars <= _SCRATCHPAD_CHAR_BUDGET:
+        return format_to_tool_messages(intermediate_steps)
 
     cutoff = max(0, len(intermediate_steps) - _SCRATCHPAD_FULL_STEPS)
     compacted = []
     for i, (action, output) in enumerate(intermediate_steps):
         if i < cutoff:
             out_str = str(output)
-            if len(out_str) > _SCRATCHPAD_OLD_OUT_CHARS:
-                output = (
-                    out_str[:_SCRATCHPAD_OLD_OUT_CHARS]
-                    + f" … [truncated, {len(out_str)} chars total]"
-                )
+            is_error = '"success": false' in out_str or '"error":' in out_str
+            budget = None if is_error else _tool_char_budget(action.tool)
+            if budget is not None and len(out_str) > budget:
+                output = out_str[:budget] + f" … [truncated, {len(out_str)} chars total]"
         compacted.append((action, output))
 
     return format_to_tool_messages(compacted)
@@ -160,6 +214,11 @@ def _apply_anthropic_cache(prompt_value):
         -1,
     )
 
+    if first_system_idx == -1:
+        logger.info("[cache] No SystemMessage found — breakpoint 1 not placed; caching will miss")
+    if last_human_idx == -1:
+        logger.info("[cache] No HumanMessage found — breakpoint 2 not placed; caching will miss")
+
     new_messages = []
     for i, msg in enumerate(messages):
         if i == first_system_idx:
@@ -174,11 +233,29 @@ def _apply_anthropic_cache(prompt_value):
     return new_messages
 
 
+def _log_cache_stats(msg):
+    """Log Anthropic prompt-cache hit/miss statistics from the LLM response."""
+    usage = getattr(msg, "response_metadata", {}).get("usage", {})
+    cache_read  = usage.get("cache_read_input_tokens", 0)
+    cache_write = usage.get("cache_creation_input_tokens", 0)
+    uncached    = usage.get("input_tokens", 0)
+    output      = usage.get("output_tokens", 0)
+    total_input = cache_read + cache_write + uncached
+
+    if total_input:
+        hit_pct = round(cache_read / total_input * 100, 1) if total_input else 0
+        logger.info(
+            "[cache] read=%d write=%d uncached=%d output=%d | hit=%.1f%%",
+            cache_read, cache_write, uncached, output, hit_pct,
+        )
+    return msg
+
+
 def _build_agent(llm, tools, prompt):
     """
     Build the runnable chain:
       scratchpad compaction → prompt render → (optional) cache_control →
-      rate-limit-retrying LLM call → ToolsAgentOutputParser.
+      rate-limit-retrying LLM call → cache stats logging → ToolsAgentOutputParser.
     """
     bound_llm    = llm.bind_tools(tools)
     retrying_llm = _make_retrying_llm(bound_llm)
@@ -190,7 +267,59 @@ def _build_agent(llm, tools, prompt):
     if _CACHING_ENABLED:
         chain = chain | RunnableLambda(_apply_anthropic_cache)
 
-    return chain | retrying_llm | ToolsAgentOutputParser()
+    return chain | retrying_llm | RunnableLambda(_log_cache_stats) | ToolsAgentOutputParser()
+
+
+def _build_skills_catalog() -> str:
+    """
+    Scan backend/skills/ and build a compact catalog for injection into the
+    static system prompt. Each SKILL.md must follow the standard format:
+
+        # <Skill Name>
+        > <one-line description>
+
+    Only the H1 title and the first blockquote line are extracted; the rest
+    of the file is ignored here (agents call load_skill() for full details).
+    Returns an empty string if no skills are found so callers can skip safely.
+    """
+    skills_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "skills"))
+    if not os.path.isdir(skills_dir):
+        return ""
+
+    entries = []
+    for skill_name in sorted(os.listdir(skills_dir)):
+        skill_md = os.path.join(skills_dir, skill_name, "SKILL.md")
+        if not os.path.isfile(skill_md):
+            continue
+        title = skill_name
+        description = ""
+        try:
+            with open(skill_md, "r", encoding="utf-8") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    if stripped.startswith("# ") and title == skill_name:
+                        title = stripped[2:].strip()
+                    elif stripped.startswith("> "):
+                        description = stripped[2:].strip()
+                        break
+        except Exception:
+            pass
+        entries.append(f"- **{skill_name}** — {title}: {description}" if description else f"- **{skill_name}** — {title}")
+
+    if not entries:
+        return ""
+
+    return (
+        "## Available Skills\n"
+        "Call load_skill(skill_name) with the bold key to get full step-by-step instructions:\n\n"
+        + "\n".join(entries)
+    )
+
+
+# Computed once at import — scanning skills dir on every LLMAgents construction was wasteful
+_SKILLS_CATALOG = _build_skills_catalog()
 
 
 def _system_template(static_text: str):
@@ -211,6 +340,18 @@ def _system_template(static_text: str):
     return ("system", static_text + "\n\n## Current Task Context\n{task_context}")
 
 
+class ResearchAgentInput(BaseModel):
+    query: str = Field(
+        ...,
+        description=(
+            "Detailed description of what to research. Include: the company or entity, "
+            "the specific data points needed (e.g. revenue, EBITDA margin, WACC), "
+            "the time period, and preferred source types (SEC filing, BSE AR, IR page). "
+            "The more specific, the better." 
+        ),
+    )
+
+
 class LLMAgents:
     def __init__(self, llm_type: str = "fast"):
 
@@ -221,16 +362,10 @@ class LLMAgents:
 
         self.search_budget     = SearchBudget(limit=5)
         self.research_tools    = create_research_tools(budget=self.search_budget)
+        self.skill_tools       = create_skill_tools()
         self.read_tools        = create_read_tools(self.sheet_service)
         self.write_tools       = create_write_tools(self.sheet_service)
         self.python_tools      = create_python_tools(self.sheet_service)
-
-        self.planner_tools     = self.research_tools + self.read_tools
-        self.replanner_tools   = self.research_tools + self.read_tools
-        self.execution_tools   = self.write_tools + self.read_tools + self.python_tools + self.research_tools
-        self.verification_tools = self.read_tools + self.python_tools
-        self.basic_tools       = []
-        self.generic_tools     = self.read_tools + self.write_tools + self.python_tools + self.research_tools
 
         prompts_dir = os.path.join(os.path.dirname(__file__), "prompts")
 
@@ -238,12 +373,60 @@ class LLMAgents:
             with open(os.path.join(prompts_dir, name), "r", encoding="utf-8") as f:
                 return f.read().strip()
 
-        self.plannerPromptTemplate    = self._build_template(_load("planner.txt"))
-        self.replannerPromptTemplate  = self._build_template(_load("replanner.txt"))
+        def _with_catalog(text: str) -> str:
+            return text + ("\n\n" + _SKILLS_CATALOG if _SKILLS_CATALOG else "")
+
+        self.plannerPromptTemplate    = self._build_template(_with_catalog(_load("planner.txt")))
+        self.replannerPromptTemplate  = self._build_template(_with_catalog(_load("replanner.txt")))
         self.researcherPromptTemplate = self._build_template(_load("researcher.txt"))
-        self.verifierPromptTemplate   = self._build_template(_load("verifier.txt"))
+        self.verifierPromptTemplate   = self._build_template(_with_catalog(_load("verifier.txt")))
         self.executionPromptTemplate  = self._build_template(_load("execution.txt"))
         self.genericPromptTemplate    = self._build_template(_load("generic.txt"))
+
+        # Researcher sub-agent: a full AgentExecutor wrapped as a single tool so
+        # that planner/replanner/execution can delegate all search orchestration
+        # to it instead of calling raw search tools directly.
+        # Always uses the fast LLM — it runs as a tool call within the outer agent's
+        # loop and search quality/cost matters more than reasoning depth here.
+        self.researcherExecutor = AgentExecutor(
+            agent=_build_agent(get_llm("fast"), self.research_tools, self.researcherPromptTemplate),
+            tools=self.research_tools,
+            max_iterations=50,
+            verbose=True,
+            handle_parsing_errors=True,
+        )
+
+        def _invoke_researcher(query: str) -> str:
+            self.search_budget.reset(limit=_RESEARCHER_SEARCH_LIMIT)
+            try:
+                result = self.researcherExecutor.invoke({
+                    "input": query,
+                    "task_context": "",  # researcher operates on the query alone; no pipeline context needed
+                })
+                return result.get("output", "Research sub-agent returned no output.")
+            except Exception as e:
+                return f"Research failed: {e}"
+
+        self.researcher_tool = StructuredTool.from_function(
+            func=_invoke_researcher,
+            name="research",
+            description=(
+                "Spawn a dedicated research sub-agent that searches the web, fetches filings, "
+                "and returns clean structured findings with source citations. "
+                "Pass a detailed query describing the entity, specific data points, time period, "
+                "and preferred source type. The sub-agent handles all search orchestration — "
+                "do NOT call web_search or fetch_url yourself."
+            ),
+            args_schema=ResearchAgentInput,
+            handle_tool_error=True,
+        )
+
+        self.planner_tools      = self.read_tools + self.skill_tools + [self.researcher_tool]
+        self.replanner_tools    = self.read_tools + self.skill_tools + [self.researcher_tool]
+        self.execution_tools    = self.write_tools + self.read_tools + self.python_tools + [self.researcher_tool]
+        self.verification_tools = self.read_tools + self.python_tools + self.skill_tools
+        self.basic_tools        = []
+        self.generic_tools      = self.read_tools + self.write_tools + self.python_tools + self.research_tools
 
         # Basic agent's system prompt is injected at runtime via {system_prompt}
         # (three possible short strings from chat.py). It's below the
@@ -280,21 +463,27 @@ class LLMAgents:
 
 
 
+# Module-level cache: LLMAgents is expensive to build (LLM client, Sheets service,
+# tool factories, prompt file reads, researcher executor). Safe to reuse across
+# requests for a single-user add-on — the only mutable state is search_budget,
+# which is always reset before each agent call via getAgent / _invoke_researcher.
+_llm_agents_cache: dict = {}
+
+
 def getAgent(agentType: str, llm_type: str = "fast"):
     """Factory: return a configured AgentExecutor for the requested agent type."""
-    pro_llmAgents  = LLMAgents("pro")
-    fast_llmAgents = LLMAgents("fast")
-
-    llmAgents = pro_llmAgents if llm_type == "pro" else fast_llmAgents
+    if llm_type not in _llm_agents_cache:
+        _llm_agents_cache[llm_type] = LLMAgents(llm_type)
+    llmAgents = _llm_agents_cache[llm_type]
 
     # (agent, tools, max_iterations, search_budget_limit)
     # search_budget_limit=0 means no search tools — budget reset is a no-op
     agents = {
-        "planner":    (llmAgents.plannerAgent,    llmAgents.planner_tools,      50, 6),
-        "replanner":  (llmAgents.replannerAgent,  llmAgents.replanner_tools,    50, 4),
+        "planner":    (llmAgents.plannerAgent,    llmAgents.planner_tools,      50, 0),
+        "replanner":  (llmAgents.replannerAgent,  llmAgents.replanner_tools,    50, 0),
         "researcher": (llmAgents.researcherAgent, llmAgents.research_tools,     50, 8),
         "verifier":   (llmAgents.verifierAgent,   llmAgents.verification_tools, 50, 0),
-        "execution":  (llmAgents.executionAgent,  llmAgents.execution_tools,    60, 3),
+        "execution":  (llmAgents.executionAgent,  llmAgents.execution_tools,    60, 0),
         "generic":    (llmAgents.genericAgent,    llmAgents.generic_tools,      50, 5),
         "basic":      (llmAgents.basicAgent,      llmAgents.basic_tools,         5, 0),
     }

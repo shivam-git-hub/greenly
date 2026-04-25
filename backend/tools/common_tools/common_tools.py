@@ -16,6 +16,13 @@ from dotenv import load_dotenv
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
+try:
+    import trafilatura as _trafilatura
+    _TRAFILATURA_AVAILABLE = True
+except ImportError:
+    _trafilatura = None
+    _TRAFILATURA_AVAILABLE = False
+
 from tools.cell_content.write_values import write_values
 from tools.read_structure.read_range import read_range
 from tools.read_structure.read_sheet_structure import read_sheet_structure
@@ -180,11 +187,15 @@ def fetch_url(
         content_type = resp.headers.get("Content-Type", "").lower()
         is_pdf = "application/pdf" in content_type or url.lower().split("?")[0].endswith(".pdf")
 
-        raw = b""
+        # E4: accumulate chunks into a list, join once — avoids O(n²) bytes reallocation
+        raw_parts: list = []
+        total_bytes = 0
         for chunk in resp.iter_content(chunk_size=65536):
-            raw += chunk
-            if len(raw) >= _MAX_FETCH_BYTES:
+            raw_parts.append(chunk)
+            total_bytes += len(chunk)
+            if total_bytes >= _MAX_FETCH_BYTES:
                 break
+        raw = b"".join(raw_parts)
 
         tables: list = []
         if is_pdf:
@@ -208,12 +219,28 @@ def fetch_url(
             text = "\n\n".join(text_parts)
             detected_type = "pdf"
         elif "text/html" in content_type:
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(raw, "lxml")
-            for tag in soup(["script", "style", "nav", "footer", "header"]):
-                tag.decompose()
-            text = soup.get_text(separator="\n")
-            text = _re.sub(r"\n{3,}", "\n\n", text).strip()
+            # E3: pass raw bytes — trafilatura and BeautifulSoup both detect encoding
+            # from the byte stream / <meta charset>, avoiding UTF-8 decode corruption
+            text = ""
+            if _TRAFILATURA_AVAILABLE:
+                try:
+                    text = _trafilatura.extract(
+                        raw,
+                        include_tables=False,
+                        include_links=False,
+                        include_comments=False,
+                        output_format="txt",
+                    ) or ""
+                except Exception:
+                    pass
+            if not text:
+                # Fallback: BeautifulSoup accepts bytes and detects charset via lxml
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(raw, "lxml")
+                for tag in soup(["script", "style", "nav", "footer", "header"]):
+                    tag.decompose()
+                text = soup.get_text(separator="\n")
+                text = _re.sub(r"\n{3,}", "\n\n", text).strip()
             detected_type = "html"
         else:
             text = raw.decode("utf-8", errors="replace")
@@ -866,6 +893,50 @@ def write_df_to_sheet(
     except Exception as e:
         logger.error("write_df_to_sheet error: %s", e)
         return {"success": False, "error": str(e)}
+
+
+# ── Skills loader ─────────────────────────────────────────────────────────────
+
+_SKILLS_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "skills"))
+
+
+def load_skill(skill_name: str) -> dict:
+    """
+    Load the SKILL.md documentation for a named skill from the skills library.
+    Call this during planning to understand exactly how to execute a skill
+    (e.g. 'DCF' for discounted cash flow analysis). Returns the full markdown
+    content of the skill's SKILL.md file, including required inputs, steps,
+    and expected outputs. If the skill is not found, returns the list of
+    available skills so you can pick the correct name.
+    """
+    skill_name = skill_name.strip()
+
+    if not skill_name or ".." in skill_name or "/" in skill_name or "\\" in skill_name:
+        return {"success": False, "error": f"Invalid skill name: '{skill_name}'"}
+
+    skill_path = os.path.normpath(os.path.join(_SKILLS_DIR, skill_name, "SKILL.md"))
+
+    if not os.path.isfile(skill_path):
+        try:
+            available = sorted(
+                d for d in os.listdir(_SKILLS_DIR)
+                if os.path.isdir(os.path.join(_SKILLS_DIR, d))
+            )
+        except Exception:
+            available = []
+        return {
+            "success": False,
+            "error": f"Skill '{skill_name}' not found.",
+            "available_skills": available,
+        }
+
+    try:
+        with open(skill_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        logger.info("load_skill: loaded '%s' (%d chars)", skill_name, len(content))
+        return {"success": True, "skill_name": skill_name, "content": content}
+    except Exception as e:
+        return {"success": False, "error": f"Failed to read SKILL.md: {e}"}
 
 
 # ── LangChain tool factories ───────────────────────────────────────────────────
