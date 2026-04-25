@@ -4,7 +4,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-_PROVIDER = os.getenv("LLM_PROVIDER", "google").lower()
+_PROVIDER   = os.getenv("LLM_PROVIDER", "google").lower()
+_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "8192"))
 
 # Anthropic models
 _ANTHROPIC_FAST = "claude-haiku-4-5-20251001"
@@ -25,8 +26,8 @@ def get_llm(type: str = "fast"):
     if _PROVIDER == "anthropic":
         from langchain_anthropic import ChatAnthropic
         model = _ANTHROPIC_FAST if type == "fast" else _ANTHROPIC_PRO
-        return ChatAnthropic(model=model, max_tokens=8192)
+        return ChatAnthropic(model=model, max_tokens=_MAX_TOKENS)
     else:
         from langchain_google_genai import ChatGoogleGenerativeAI
         model = _GOOGLE_FAST if type == "fast" else _GOOGLE_PRO
-        return ChatGoogleGenerativeAI(model=model, max_tokens=8192)
+        return ChatGoogleGenerativeAI(model=model, max_tokens=_MAX_TOKENS)

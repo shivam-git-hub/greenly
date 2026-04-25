@@ -1,9 +1,9 @@
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import asdict
-from typing import Any
 
 from flask import Blueprint, request, jsonify
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
@@ -30,7 +30,8 @@ _task_contexts: dict[str, TaskContext] = {}
 _HISTORY_MAX_CHARS  = 12_000  # ~3k tokens — trigger summarisation above this
 _HISTORY_KEEP_PAIRS = 2       # always keep N most-recent H/A pairs verbatim
 
-_MAX_ITERATIONS = 50          # hard cap on plan-execute-verify cycles per request
+_MAX_ITERATIONS        = int(os.getenv("PIPELINE_MAX_ITERATIONS", "50"))
+_MAX_EXCEPTION_RETRIES = int(os.getenv("PIPELINE_MAX_EXCEPTION_RETRIES", "5"))
 
 _SUMMARY_SYSTEM_PROMPT = (
     "You are a conversation memory compactor for an AI spreadsheet assistant. "
@@ -136,6 +137,23 @@ def _topo_sort(steps: list) -> list:
     return result
 
 
+def _log_task_context(agent_type: str, tc: TaskContext, slim: bool = False) -> None:
+    """Log the full serialized task_context being sent to an agent. Useful for debugging
+    why an agent is making a decision (wrong sheet structure, stale plan, etc.)."""
+    serialized = _serialize_task_context(tc, slim=slim)
+    logger.info(
+        "[TASK_CONTEXT → %s] status=%s iter=%d/%d sheet_id=%s plan_steps=%d serialized_len=%d",
+        agent_type,
+        tc.status,
+        tc.current_iteration,
+        tc.max_iteration,
+        tc.active_sheet_id,
+        len((tc.plan or {}).get("steps", [])),
+        len(serialized),
+    )
+    logger.info("[TASK_CONTEXT → %s body]\n%s", agent_type, serialized)
+
+
 def _parse_output(raw_result: dict) -> dict:
     out = raw_result.get("output", "{}")
     if isinstance(out, list):
@@ -149,25 +167,6 @@ def _parse_output(raw_result: dict) -> dict:
         return {"status": "failed"}
 
 
-def _extract_cache_stats(response: Any, stats: dict) -> None:
-    """Extract Anthropic cache statistics from LLM response metadata."""
-    try:
-        response_metadata = getattr(response, "response_metadata", {}) or {}
-        usage = response_metadata.get("usage", {}) or {}
-        cache_read = usage.get("cache_read_input_tokens", 0) or 0
-        cache_create = usage.get("cache_creation_input_tokens", 0) or 0
-        input_tokens = usage.get("input_tokens", 0) or 0
-        output_tokens = usage.get("output_tokens", 0) or 0
-
-        if cache_read > 0 or cache_create > 0:
-            stats["cache_hit_input_tokens"] += cache_read
-            stats["cache_hit_creation_tokens"] += cache_create
-        else:
-            stats["cache_miss_input_tokens"] += input_tokens
-            stats["cache_miss_creation_tokens"] += output_tokens
-    except Exception:
-        pass
-
 
 @chat_bp.route("/api/v1/chat", methods=["POST"])
 def chat():
@@ -179,11 +178,8 @@ def chat():
     data = request.get_json()
 
     spreadsheet_id  = data.get("spreadsheetId", "")
-    active_sheet    = data.get("activeSheet", "")
     active_sheet_id = data.get("activeSheetId")
-    active_range    = data.get("activeRange", "")
     query           = data.get("query", "")
-    mode            = data.get("mode", "ask")
     effort          = data.get("effort", "fast")
 
     if not query:
@@ -240,17 +236,10 @@ def chat():
         "replanner_calls": 0,
         "fast_agent_calls": 0,
         "effort_agent_calls": 0,
-        "cache_hit_input_tokens": 0,
-        "cache_hit_creation_tokens": 0,
-        "cache_miss_input_tokens": 0,
-        "cache_miss_creation_tokens": 0,
-        "phase_timings": {},
         "tool_call_timings": [],
         "failed_tool_calls": [],
-        "state_transitions": [],
     }
     phase_start_time = time.time()
-    stats["phase_timings"]["init"] = 0.0
 
     # Main orchestration loop. current_iteration counts FULL planning cycles
     # (incremented only on entering planner / replanner). Inner state transitions
@@ -260,16 +249,13 @@ def chat():
     exhausted = False
     pipeline_error: str = ""
     exception_retries = 0
-    _MAX_EXCEPTION_RETRIES = 5
 
     logger.info(f"[AGENT LOOP] Starting agent loop for query: {query[:100]}...")
     logger.info(f"[AGENT LOOP] Initial status: {task_context.status}, effort: {effort}")
 
     while task_context.status != "completed":
         try:
-
-            task_context.sheet_structure = read_sheet_structure(sheet_service, spreadsheet_id)
-
+            
             if task_context.status in ("planning", "replanning"):
                 logger.info(f"[PHASE] {task_context.status.upper()} - Iteration {task_context.current_iteration}/{task_context.max_iteration}")
 
@@ -287,13 +273,14 @@ def chat():
                 agent = getAgent(agent_type, effort)
                 task_context.sheet_structure = read_sheet_structure(sheet_service, spreadsheet_id)
 
+                _log_task_context(agent_type, task_context)
+
                 llm_start = time.time()
                 raw_result = agent.invoke({
                     "task_context": _serialize_task_context(task_context),
                     "input": query,
                     "chat_history": request_history,
                 })
-                _extract_cache_stats(raw_result, stats)
 
                 stats["total_iterations"] += 1
                 if effort == "fast":
@@ -338,6 +325,8 @@ def chat():
                 task_context.sheet_structure = read_sheet_structure(sheet_service, spreadsheet_id)
                 serialized_context = _serialize_task_context(task_context)
 
+                _log_task_context("execution", task_context)
+
                 for step in sorted_steps:
                     step_id = step.get("id", "?")
                     complexity = step.get("complexity", "low")
@@ -350,7 +339,6 @@ def chat():
                         "completed_steps": completed_steps,
                     })
                     execution_agent = getAgent("execution", llm_type)
-                    stats["executor_calls"] += 1
                     if llm_type == "fast":
                         stats["fast_agent_calls"] += 1
                     else:
@@ -364,7 +352,6 @@ def chat():
                             "input": step_input,
                         })
                         tool_call_time = time.time() - tool_call_start
-                        _extract_cache_stats(raw_result, stats)
                     except Exception as te:
                         tool_call_time = time.time() - tool_call_start
                         stats["tool_call_timings"].append({
@@ -442,6 +429,8 @@ def chat():
                 stats["fast_agent_calls"] += 1
                 task_context.sheet_structure = read_sheet_structure(sheet_service, spreadsheet_id)
 
+                _log_task_context("verifier", task_context)
+
                 verify_start = time.time()
                 raw_result = verifier_agent.invoke({
                     "task_context": _serialize_task_context(task_context),
@@ -449,7 +438,6 @@ def chat():
                     "chat_history": request_history,
                 })
                 verify_time = time.time() - verify_start
-                _extract_cache_stats(raw_result, stats)
 
                 logger.info(f"[AGENT] Verifier call completed in {verify_time:.2f}s")
 
@@ -461,6 +449,8 @@ def chat():
 
             else:
                 logger.error(f"recieved task_context.status {task_context.status}")
+                exhausted = True
+                pipeline_error = f"Unexpected pipeline status: {task_context.status}"
                 break
 
 
@@ -471,9 +461,22 @@ def chat():
                 pipeline_error = str(e)
                 exhausted = True
                 break
-            request_history.append(AIMessage(content=f"Exception occurred: {str(e)}"))
-            request_history.append(HumanMessage(content="An exception occurred during execution. Please analyze the error, fix whatever caused it, and retry completing the current step. Stay in the same status state and continue the task."))
-            logger.warning(f"[EXCEPTION] Retry {exception_retries}/{_MAX_EXCEPTION_RETRIES} - {str(e)[:200]}")
+            if task_context.status == "executing":
+                # Execution exceptions go to replanning so the replanner sees the
+                # error in history and can produce a corrected plan.
+                task_context.status = "replanning"
+                task_context.execution_report = {
+                    "steps_executed": [],
+                    "artifacts": {"sheets_modified": [], "ranges_written": []},
+                    "notes": f"Execution aborted due to exception: {str(e)[:300]}",
+                }
+                request_history.append(AIMessage(content=f"Execution failed with exception: {str(e)}"))
+                request_history.append(HumanMessage(content="Execution crashed. Replan and avoid whatever caused this error."))
+                logger.warning("[EXCEPTION] Execution crash → replanning (retry %d/%d): %s", exception_retries, _MAX_EXCEPTION_RETRIES, str(e)[:200])
+            else:
+                request_history.append(AIMessage(content=f"Exception occurred: {str(e)}"))
+                request_history.append(HumanMessage(content="An exception occurred. Please analyze the error and retry."))
+                logger.warning("[EXCEPTION] Retry %d/%d at %s: %s", exception_retries, _MAX_EXCEPTION_RETRIES, task_context.status, str(e)[:200])
             continue
 
     total_loop_time = time.time() - phase_start_time
@@ -492,20 +495,6 @@ def chat():
     logger.info(f"[STATS] Fast Agent Calls:       {stats['fast_agent_calls']}")
     logger.info(f"[STATS] Effort Agent Calls:     {stats['effort_agent_calls']}")
     logger.info(f"[STATS] Exception Retries:      {exception_retries}")
-    logger.info("-" * 60)
-    logger.info("[STATS] ========== CACHE STATISTICS ==========")
-    logger.info(f"[STATS] Cache Hit Input:        {stats['cache_hit_input_tokens']} tokens")
-    logger.info(f"[STATS] Cache Hit Creation:     {stats['cache_hit_creation_tokens']} tokens")
-    logger.info(f"[STATS] Cache Miss Input:       {stats['cache_miss_input_tokens']} tokens")
-    logger.info(f"[STATS] Cache Miss Creation:    {stats['cache_miss_creation_tokens']} tokens")
-    total_input = stats['cache_hit_input_tokens'] + stats['cache_miss_input_tokens']
-    if total_input > 0:
-        cache_savings = (stats['cache_hit_input_tokens'] / total_input) * 100
-        logger.info(f"[STATS] Cache Hit Rate:         {cache_savings:.1f}%")
-    logger.info("-" * 60)
-    logger.info("[STATS] ========== PHASE TIMINGS ==========")
-    for phase, duration in stats["phase_timings"].items():
-        logger.info(f"[STATS] {phase:20s}: {duration:6.2f}s")
     logger.info(f"[STATS] Total Loop Time:        {total_loop_time:.2f}s")
     logger.info("-" * 60)
     logger.info("[STATS] ========== TOP 10 SLOWEST TOOL CALLS ==========")
@@ -522,10 +511,6 @@ def chat():
             logger.info(f"[STATS]    Exception: {fc.get('exception', '')[:200]}")
     else:
         logger.info("[STATS] No failed tool calls")
-    logger.info("-" * 60)
-    logger.info("[STATS] ========== STATE TRANSITIONS ==========")
-    for st in stats["state_transitions"]:
-        logger.info(f"[STATS] {st['from']:15s} -> {st['to']}")
     logger.info("=" * 60)
 
     final_status = "failed" if exhausted else "completed"
@@ -552,6 +537,7 @@ def chat():
         )
 
     basic_agent = getAgent("basic", effort)
+    _log_task_context("basic", task_context, slim=True)
     basic_start = time.time()
     result = basic_agent.invoke({
         "task_context": _serialize_task_context(task_context, slim=True),
@@ -559,7 +545,6 @@ def chat():
         "system_prompt": basic_system_prompt,
         "chat_history": request_history,
     })
-    _extract_cache_stats(result, stats)
     logger.info(f"[AGENT] Basic agent call completed in {time.time() - basic_start:.2f}s")
     output = result.get("output", "")
     if isinstance(output, list):

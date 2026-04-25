@@ -3,7 +3,7 @@ var SESSION_ID_KEY = "SESSION_ID";
 var LLM_MODE_KEY = "LLM_MODE";
 
 
-setBackendUrl("https://342b-103-226-5-207.ngrok-free.app")
+setBackendUrl("https://17d8-103-226-5-207.ngrok-free.app")
 function setBackendUrl(url) {
   PropertiesService.getScriptProperties().setProperty(BACKEND_URL_KEY, url);
 }

@@ -626,7 +626,8 @@ def _make_sandbox_namespace() -> dict:
         "json": json,
         "math": math,
         "statistics": statistics,
-        "datetime": _datetime,
+        "datetime": _datetime,           # module  → datetime.datetime(...), datetime.date(...)
+        "timedelta": _datetime.timedelta, # shortcut so timedelta(days=1) works directly
         "re": _re,
     }
     try:
@@ -639,17 +640,30 @@ def _make_sandbox_namespace() -> dict:
 
 def run_python(code: str, timeout: int = 30, _ns: dict = None) -> dict:
     """
-    Execute Python code in a sandboxed namespace. Pre-injected modules:
-    pd, np (if installed), math, statistics, datetime, re, json. `import`
-    is disabled — code can only use these plus any DataFrames already in _ns.
+    Execute Python code in a sandboxed namespace.
 
-    stdout is captured per-call by overriding `print` in the namespace's
-    builtins (no global sys.stdout mutation), so concurrent runs from
-    different sessions don't pollute each other's output.
+    Pre-injected names — use these directly, `import` is DISABLED:
+      pd          — pandas
+      np          — numpy (if installed)
+      json        — json module  (json.dumps, json.loads)
+      math        — math module
+      statistics  — statistics module
+      re          — re module
+      datetime    — the datetime MODULE (not the class). Use:
+                      datetime.datetime(2025, 1, 15)
+                      datetime.date.today()
+                      datetime.datetime.now()
+      timedelta   — datetime.timedelta class directly. Use:
+                      timedelta(days=7)
 
-    Caveat: Python threads cannot be forcibly killed. If execution times
-    out, the worker thread may still be running and can mutate _ns after
-    this function returns. Avoid long-running operations inside the sandbox.
+    DO NOT write `import X` or `from X import Y` — __import__ is blocked.
+    DO NOT write `datetime(...)` — datetime is the module, not the class.
+    Use `datetime.datetime(...)` instead.
+
+    To pass computed list values to write_values, print them as JSON:
+      print(json.dumps(your_list))
+    Then copy the output into write_values.values (double-quoted strings only).
+    Or better: build a DataFrame and use write_df_to_sheet.
     """
     ns = _ns if _ns is not None else _make_sandbox_namespace()
     stdout_buf = io.StringIO()

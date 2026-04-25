@@ -83,7 +83,17 @@ from .common_tools.common_tools import (
 class WriteValuesInput(BaseModel):
     spreadsheetId: str
     range: str
-    values: List[List[Any]]
+    values: List[List[Any]] = Field(
+        ...,
+        description=(
+            "2-D list of cell values. Must be a proper JSON array of arrays with ALL "
+            "string values double-quoted. Example: "
+            '[[\"2025-01-01\", \"Revenue\"], [\"2025-01-02\", \"42\"]]. '
+            "Never pass a Python repr (single-quoted or unquoted). "
+            "If values were computed in run_python, store them in a variable and use "
+            "write_df_to_sheet instead, or re-print as json.dumps(values) and pass that."
+        ),
+    )
     valueInputOption: str = "USER_ENTERED"
 
     @field_validator("values", mode="before")
@@ -99,6 +109,13 @@ class WriteValuesInput(BaseModel):
                         return parsed
                 except Exception:
                     continue
+            raise ValueError(
+                "Could not parse `values` as a list. Pass a proper JSON array of arrays "
+                "with all strings double-quoted, e.g. "
+                '[[\"2025-01-01\"], [\"hello\"]]. '
+                "If values were computed in run_python, re-emit them with: "
+                "import json; print(json.dumps(your_list))"
+            )
         return v
 
 class ValidateFormulaInput(BaseModel):
@@ -115,7 +132,7 @@ class WriteFormulasInput(BaseModel):
 
 class ReadRangeInput(BaseModel):
     spreadsheetId: str
-    range: str
+    range: str = Field(..., description="A1 notation range. Capped at 500 rows per call. For larger datasets, use get_chunk instead.")
 
 class ReadSheetStructureInput(BaseModel):
     spreadsheetId: str
@@ -123,7 +140,7 @@ class ReadSheetStructureInput(BaseModel):
 class GetChunkInput(BaseModel):
     spreadsheetId: str
     sheetTitle: str
-    startRow: int
+    startRow: int = Field(..., description="1-based start row. Use this for large datasets (>500 rows) — prefer it over read_range for big ranges.")
     endRow: int
     columns: str = None
 
@@ -322,7 +339,18 @@ class WriteDfToSheetInput(BaseModel):
 
 _SKIP_HINT = "If this error persists after correcting the parameters, skip this step and continue with the next one."
 
-def _wrap(fn, schema, service):
+_READ_TOOL_CHAR_SOFT_LIMIT = 5_000   # truncate here and add [TRUNCATED] tag
+_READ_TOOL_CHAR_HARD_LIMIT = 10_000  # absolute ceiling (unreachable given soft limit)
+
+
+def _cap_read_output(text: str) -> str:
+    """Truncate read-tool output to _READ_TOOL_CHAR_SOFT_LIMIT chars and tag it."""
+    if len(text) > _READ_TOOL_CHAR_SOFT_LIMIT:
+        return "[TRUNCATED] " + text[:_READ_TOOL_CHAR_SOFT_LIMIT]
+    return text
+
+
+def _wrap(fn, schema, service, cap: bool = False):
     def runner(**kwargs):
         try:
             result = fn(service, **kwargs)
@@ -332,7 +360,10 @@ def _wrap(fn, schema, service):
                 err = str(result["error"])
                 result["error"] = err[:400] + (" …" if len(err) > 400 else "")
                 result["hint"] = _SKIP_HINT
-            return json.dumps(result, default=str)
+            out = json.dumps(result, default=str)
+            if cap:
+                out = _cap_read_output(out)
+            return out
         except Exception as e:
             logger.warning("Tool %s raised: %s", fn.__name__, e)
             return json.dumps({
@@ -354,17 +385,17 @@ def _wrap(fn, schema, service):
 def create_read_tools(service) -> list:
     """Tools that only read or inspect spreadsheet data — no mutations."""
     return [
-        _wrap(read_range, ReadRangeInput, service),
-        _wrap(read_sheet_structure, ReadSheetStructureInput, service),
-        _wrap(get_chunk, GetChunkInput, service),
-        _wrap(get_cell_format, GetCellFormatInput, service),
-        _wrap(get_conditional_formats, GetConditionalFormatsInput, service),
-        _wrap(get_charts, GetChartsInput, service),
-        _wrap(get_pivot_tables, GetPivotTablesInput, service),
-        _wrap(get_named_ranges, GetNamedRangesInput, service),
-        _wrap(get_data_validations, GetDataValidationsInput, service),
-        _wrap(audit_formulas, AuditFormulasInput, service),
-        _wrap(trace_dependents, TraceDependentsInput, service),
+        _wrap(read_range,              ReadRangeInput,              service, cap=True),
+        _wrap(read_sheet_structure,    ReadSheetStructureInput,     service, cap=True),
+        _wrap(get_chunk,               GetChunkInput,               service, cap=True),
+        _wrap(get_cell_format,         GetCellFormatInput,          service, cap=True),
+        _wrap(get_conditional_formats, GetConditionalFormatsInput,  service, cap=True),
+        _wrap(get_charts,              GetChartsInput,              service, cap=True),
+        _wrap(get_pivot_tables,        GetPivotTablesInput,         service, cap=True),
+        _wrap(get_named_ranges,        GetNamedRangesInput,         service, cap=True),
+        _wrap(get_data_validations,    GetDataValidationsInput,     service, cap=True),
+        _wrap(audit_formulas,          AuditFormulasInput,          service, cap=True),
+        _wrap(trace_dependents,        TraceDependentsInput,        service, cap=True),
     ]
 
 

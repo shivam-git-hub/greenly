@@ -1,6 +1,7 @@
 import logging
 from collections import deque
-from ..utils import index_to_col_letter
+import re
+from ..utils import index_to_col_letter, col_letter_to_index
 
 logger = logging.getLogger(__name__)
 
@@ -104,14 +105,6 @@ def read_sheet_structure(service, spreadsheetId: str) -> dict:
         sheets_summary = []
         for sheet in meta.get("sheets", []):
             props = sheet["properties"]
-            grid  = props.get("gridProperties", {})
-            row_count = grid.get("rowCount", 0)
-            col_count = grid.get("columnCount", 0)
-            used_range = (
-                f"A1:{index_to_col_letter(col_count - 1)}{row_count}"
-                if row_count and col_count
-                else "A1"
-            )
 
             formula_count = 0
             for grid_data in sheet.get("data", []):
@@ -120,13 +113,30 @@ def read_sheet_structure(service, spreadsheetId: str) -> dict:
                         if cell.get("userEnteredValue", {}).get("formulaValue"):
                             formula_count += 1
 
+            blocks = _find_data_blocks(sheet)
+
+            # Derive usedRange from actual data blocks, NOT gridProperties.rowCount /
+            # columnCount. gridProperties reflects sheet grid capacity (default 1000 rows)
+            # not where data ends, which causes agents to request ranges far beyond real data.
+            if blocks:
+                max_row = max_col = 0
+                for b in blocks:
+                    end_cell = b["range"].split(":")[1]
+                    m = re.match(r"([A-Z]+)(\d+)", end_cell)
+                    if m:
+                        max_col = max(max_col, col_letter_to_index(m.group(1)))
+                        max_row = max(max_row, int(m.group(2)))
+                used_range = f"A1:{index_to_col_letter(max_col)}{max_row}"
+            else:
+                used_range = "empty"
+
             sheets_summary.append({
                 "sheetId":      props["sheetId"],
                 "title":        props["title"],
                 "index":        props["index"],
                 "usedRange":    used_range,
                 "formulaCount": formula_count,
-                "dataBlocks":   _find_data_blocks(sheet),
+                "dataBlocks":   blocks,
             })
 
         sheets_map = {s["sheetId"]: s["title"] for s in sheets_summary}
@@ -165,6 +175,13 @@ def read_sheet_structure(service, spreadsheetId: str) -> dict:
             "sheets":        sheets_summary,
             "namedRanges":   named_ranges,
         }
+        # Per-sheet detail so we can spot at a glance whether the structure tool
+        # is correctly reporting an empty sheet vs one full of data.
+        for s in sheets_summary:
+            logger.info(
+                "  sheet[%s]: usedRange=%s blocks=%d formulas=%d",
+                s["title"], s["usedRange"], len(s["dataBlocks"]), s["formulaCount"],
+            )
         logger.info(
             "read_sheet_structure response: %d sheets, %d named ranges",
             len(sheets_summary), len(named_ranges),

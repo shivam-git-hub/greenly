@@ -25,10 +25,13 @@ def read_range(service, spreadsheetId: str, range: str) -> dict:
             fields="sheets.data.rowData.values(userEnteredValue,effectiveValue,formattedValue)",
         ).execute()
 
+        _MAX_ROWS = 30
         cells = []
         for sheet_data in result.get("sheets", []):
             for grid_data in sheet_data.get("data", []):
                 for row_data in grid_data.get("rowData", []):
+                    if len(cells) >= _MAX_ROWS:
+                        break
                     row = [
                         {
                             "value":        get_effective_value(cell),
@@ -39,8 +42,14 @@ def read_range(service, spreadsheetId: str, range: str) -> dict:
                     ]
                     cells.append(row)
 
-        response = {"success": True, "range": range, "cells": cells}
-        logger.info("read_range response: range=%s rows=%d", range, len(cells))
+        truncated = len(cells) == _MAX_ROWS
+        response = {
+            "success":   True,
+            "range":     range,
+            "cells":     cells,
+            **({"warning": f"Response capped at {_MAX_ROWS} rows. Use get_chunk for full data."} if truncated else {}),
+        }
+        logger.info("read_range response: range=%s rows=%d%s", range, len(cells), " (capped)" if truncated else "")
         return response
     except Exception as e:
         logger.error("Error reading range: %s", e)

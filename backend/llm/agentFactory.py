@@ -32,8 +32,8 @@ from utils import load_access_token_from_file
 logger = logging.getLogger(__name__)
 
 # Retry config for per-LLM-call backoff (scratchpad is preserved between retries)
-_LLM_RETRY_MAX    = 6
-_LLM_RETRY_BASE_S = 15   # doubles each attempt, capped at 120s
+_LLM_RETRY_MAX    = int(os.getenv("LLM_RETRY_MAX", "6"))
+_LLM_RETRY_BASE_S = int(os.getenv("LLM_RETRY_BASE_S", "5"))   # doubles each attempt, capped at 120s; overridden by retry-after header when present
 
 # Scratchpad compaction settings
 _SCRATCHPAD_FULL_STEPS        = 4       # keep the last N steps at full detail
@@ -63,7 +63,7 @@ _TOOLS_WRITE = frozenset({
 # Search budget for the researcher sub-agent (called via the `research` tool).
 # This is the effective limit — the search_limit column in getAgent is irrelevant
 # for agents that use researcher_tool instead of raw search tools.
-_RESEARCHER_SEARCH_LIMIT = 20
+_RESEARCHER_SEARCH_LIMIT = int(os.getenv("RESEARCHER_SEARCH_LIMIT", "20"))
 
 # Prompt caching is an Anthropic-only feature. langchain-anthropic forwards
 # `cache_control` blocks in message content through to the Messages API.
@@ -77,11 +77,27 @@ def _is_rate_limit(exc: Exception) -> bool:
     return "rate_limit" in s or "rate limit" in s or "429" in s or "too many requests" in s
 
 
+def _get_retry_after(exc: Exception) -> int | None:
+    """Read the retry-after header from a rate-limit exception, if the provider sent one."""
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return None
+    headers = getattr(resp, "headers", {}) or {}
+    raw = headers.get("retry-after") or headers.get("Retry-After")
+    if raw:
+        try:
+            return max(1, int(float(raw)))
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
 def _make_retrying_llm(bound_llm):
     """
     Wrap a bound LLM runnable so that rate-limit errors on individual LLM calls
-    are retried with exponential backoff. The AgentExecutor's scratchpad is NOT
-    part of this call — it lives in the AgentExecutor loop — so retrying here
+    are retried. Uses the provider's retry-after header when present; falls back
+    to exponential backoff otherwise. The AgentExecutor's scratchpad is NOT part
+    of this call — it lives in the AgentExecutor loop — so retrying here
     preserves all accumulated research context.
     """
     def _invoke(input, config=None):
@@ -92,12 +108,16 @@ def _make_retrying_llm(bound_llm):
             except Exception as e:
                 if not _is_rate_limit(e) or attempt == _LLM_RETRY_MAX:
                     raise
+                server_wait = _get_retry_after(e)
+                wait = server_wait or delay
                 logger.warning(
-                    "LLM rate limit (attempt %d/%d). Backing off %ds. Error: %s",
-                    attempt, _LLM_RETRY_MAX, delay, e,
+                    "LLM rate limit (attempt %d/%d). Waiting %ds%s. Error: %s",
+                    attempt, _LLM_RETRY_MAX, wait,
+                    " [retry-after header]" if server_wait else " [backoff]",
+                    e,
                 )
-                time.sleep(delay)
-                delay = min(delay * 2, 120)
+                time.sleep(wait)
+                delay = min(delay * 2, 120)  # always advance so repeated 429s back off further
 
     return RunnableLambda(_invoke)
 
@@ -362,6 +382,21 @@ class LLMAgents:
 
         self.search_budget     = SearchBudget(limit=5)
         self.research_tools    = create_research_tools(budget=self.search_budget)
+        # TODO: skill caching optimization
+        # Currently loaded skill content (5–50KB markdown) lives in the agent scratchpad,
+        # which is never covered by a cache breakpoint — every LLM call after load_skill
+        # re-sends it uncached. Two improvements to make when ready:
+        #
+        # Part A — Cross-phase persistence: add loaded_skills: dict to TaskContext.
+        #   The load_skill wrapper writes to it. Each subsequent agent.invoke() pre-populates
+        #   a SkillsCache (like SearchBudget) from task_context.loaded_skills so planner →
+        #   execution → verifier all share the content without re-loading.
+        #
+        # Part B — In-invoke caching: add a 3rd system block [static | skills | task_context].
+        #   A RunnablePassthrough.assign step reads from a shared SkillsCache closure and
+        #   fills the skills block dynamically. _apply_anthropic_cache marks that block so
+        #   from the 2nd LLM call after load_skill the skill is cached at the system level
+        #   rather than re-sent uncached in the scratchpad on every subsequent tool call.
         self.skill_tools       = create_skill_tools()
         self.read_tools        = create_read_tools(self.sheet_service)
         self.write_tools       = create_write_tools(self.sheet_service)

@@ -3,7 +3,7 @@ from ..utils import get_effective_value
 
 logger = logging.getLogger(__name__)
 
-MAX_ROWS_PER_CHUNK = 2000
+MAX_ROWS_PER_CHUNK = 500
 
 
 def get_chunk(
