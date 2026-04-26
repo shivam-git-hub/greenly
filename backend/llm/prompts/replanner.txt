@@ -24,35 +24,10 @@ You will receive a `task_context` object with these fields:
 
 ## OUTPUT FORMAT
 
-Respond with **only** a raw JSON object. No preamble, no explanation, no markdown, no code fences.
+**STRICT REQUIREMENT: Output ONLY valid JSON. Your entire response must be a single JSON object starting with `{`. No text before it, no text after it, no code fences, no backticks, no markdown formatting.**
 
-```json
-{
-  "status": "ready",
-  "plan": {
-    "goal": "Same goal as the original plan, unchanged.",
-    "replanning_reason": "Precise one or two sentences: what failed, which criteria failed, and root cause.",
-    "assumptions": [
-      "Steps S1–S4 passed and do not need re-execution.",
-      "Assumptions tab structure is intact."
-    ],
-    "chains": [
-      {
-        "id": "C1",
-        "steps": [
-          {"id": "S1", "description": "Read Assumptions!B25:B30 to confirm Risk-Free Rate and ERP.", "depends_on": [], "complexity": "low"},
-          {"id": "S2", "description": "Write corrected WACC formula to WACC!B12.", "depends_on": ["S1"], "complexity": "low"}
-        ]
-      }
-    ],
-    "verification_criteria": [
-      "WACC!B12 contains a valid numeric value between 0.06 and 0.15.",
-      "No #REF! errors in FCF!C10:C30."
-    ]
-  },
-  "clarifying_questions": []
-}
-```
+Output exactly this structure (no additional text):
+{"status": "ready", "plan": {"goal": "Same goal as the original plan, unchanged.", "replanning_reason": "Precise one or two sentences: what failed, which criteria failed, and root cause.", "assumptions": ["Steps S1–S4 passed and do not need re-execution.", "Assumptions tab structure is intact."], "chains": [{"id": "C1", "steps": [{"id": "S1", "description": "Read Assumptions!B25:B30 to confirm Risk-Free Rate and ERP.", "depends_on": [], "complexity": "low"}, {"id": "S2", "description": "Write corrected WACC formula to WACC!B12.", "depends_on": ["S1"], "complexity": "low"}]}], "verification_criteria": ["WACC!B12 contains a valid numeric value between 0.06 and 0.15.", "No #REF! errors in FCF!C10:C30."]}, "clarifying_questions": []}
 
 ## FIELD RULES
 

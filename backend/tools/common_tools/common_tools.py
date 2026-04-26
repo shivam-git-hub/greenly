@@ -607,6 +607,8 @@ def _make_sandbox_namespace() -> dict:
     sandbox code cannot import anything beyond what's injected here.
     """
     import builtins
+    import random as _random
+    import uuid as _uuid
 
     _SAFE_BUILTINS = (
         "abs", "all", "any", "bin", "bool", "bytes", "callable", "chr",
@@ -629,6 +631,8 @@ def _make_sandbox_namespace() -> dict:
         "datetime": _datetime,           # module  → datetime.datetime(...), datetime.date(...)
         "timedelta": _datetime.timedelta, # shortcut so timedelta(days=1) works directly
         "re": _re,
+        "random": _random,               # use random.randint(), random.choice(), etc.
+        "uuid": _uuid,                   # use uuid.uuid4(), uuid.uuid1()
     }
     try:
         import numpy as np  # type: ignore
@@ -649,6 +653,8 @@ def run_python(code: str, timeout: int = 30, _ns: dict = None) -> dict:
       math        — math module
       statistics  — statistics module
       re          — re module
+      random      — random module (random.randint, random.choice, random.shuffle, etc.)
+      uuid        — uuid module (uuid.uuid4, uuid.uuid1, etc.)
       datetime    — the datetime MODULE (not the class). Use:
                       datetime.datetime(2025, 1, 15)
                       datetime.date.today()
@@ -658,7 +664,8 @@ def run_python(code: str, timeout: int = 30, _ns: dict = None) -> dict:
 
     DO NOT write `import X` or `from X import Y` — __import__ is blocked.
     DO NOT write `datetime(...)` — datetime is the module, not the class.
-    Use `datetime.datetime(...)` instead.
+      Use `datetime.datetime(...)` instead.
+    DO NOT add comments (#) in code — keep it minimal and functional.
 
     To pass computed list values to write_values, print them as JSON:
       print(json.dumps(your_list))

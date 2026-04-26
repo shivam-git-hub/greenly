@@ -313,13 +313,24 @@ def _parse_output(raw_result: dict) -> dict:
     out = raw_result.get("output", "{}")
     if isinstance(out, list):
         out = next((p.get("text", "") for p in out if isinstance(p, dict) and "text" in p), "{}")
-    match = re.search(r'```(?:json)?\s*(\{.*\})\s*```', out, re.DOTALL)
-    if match:
-        out = match.group(1)
-    try:
-        return json.loads(out)
-    except Exception:
+    if not isinstance(out, str):
+        out = str(out)
+    
+    first_brace = out.find('{')
+    if first_brace == -1:
+        logger.warning("[PARSE] No '{' found in output: %s", out[:200])
         return {"status": "failed"}
+    
+    candidate = out[first_brace:]
+    
+    for end in range(len(candidate), 0, -1):
+        try:
+            return json.loads(candidate[:end])
+        except json.JSONDecodeError:
+            continue
+    
+    logger.warning("[PARSE] Failed to extract JSON from: %s", out[:200])
+    return {"status": "failed"}
 
 
 
@@ -432,6 +443,7 @@ def chat():
 
                 llm_start = time.time()
                 logger.info(f"[AGENT CALL] Invoking {agent_type.upper()} agent")
+                json_parse_retries = 0
                 raw_result = agent.invoke({
                     "task_context": agent_ctx,
                     "input": query,
@@ -463,9 +475,14 @@ def chat():
                     total_steps = sum(len(c.get("steps", [])) for c in chains)
                     logger.info(f"[AGENT LOOP] Plan ready — {len(chains)} chain(s), {total_steps} step(s)")
                 else:
+                    json_parse_retries += 1
+                    if json_parse_retries >= 2:
+                        logger.error(f"[AGENT LOOP] {agent_type} failed after 2 JSON parse retries")
+                        pipeline_error = f"{agent_type} returned invalid JSON after 2 attempts"
+                        break
                     request_history.append(AIMessage(content=raw_result.get("output", "")))
-                    request_history.append(HumanMessage(content="Your last output was either not valid JSON or lacked a recognized 'status'. Please try again and ensure your response is a valid JSON block containing 'status' as either 'ready' or 'needs_clarification'."))
-                    logger.info(f"[AGENT LOOP] {agent_type} returned invalid JSON, retrying...")
+                    request_history.append(HumanMessage(content="Your last output was not valid JSON or lacked a recognized 'status'. Output ONLY a JSON object starting with { — no explanation, no text before or after."))
+                    logger.info(f"[AGENT LOOP] {agent_type} JSON parse retry {json_parse_retries}/2")
                     continue
 
             elif task_context.status == "executing":
