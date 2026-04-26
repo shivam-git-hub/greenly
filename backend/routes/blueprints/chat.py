@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 
 from flask import Blueprint, request, jsonify
@@ -25,6 +26,17 @@ chat_bp = Blueprint("chat", __name__)
 _chat_histories: dict[str, list] = {}
 # In-memory task contexts keyed by spreadsheetId
 _task_contexts: dict[str, TaskContext] = {}
+# Cached Sheets service — rebuilt only on first request; avoids file I/O +
+# HTTP client construction on every POST /api/v1/chat.
+_sheet_service = None
+
+
+def _get_sheet_service():
+    global _sheet_service
+    if _sheet_service is None:
+        _sheet_service = build_sheets_service(load_access_token_from_file())
+    return _sheet_service
+
 
 # ── History compaction ─────────────────────────────────────────────────────────
 _HISTORY_MAX_CHARS  = 12_000  # ~3k tokens — trigger summarisation above this
@@ -95,7 +107,8 @@ def _ensure_compact_history(history: list) -> list:
     return history
 
 
-_STEP_DESC_MAX = 200   # chars per plan step description passed to execution/verifier
+_STEP_DESC_MAX       = 200   # chars per plan step description passed to execution/verifier
+_REPLAN_EVIDENCE_MAX = 500   # chars per step evidence sent to replanner
 
 
 def _serialize_task_context(tc: TaskContext, slim: bool = False) -> str:
@@ -115,6 +128,133 @@ def _serialize_task_context(tc: TaskContext, slim: bool = False) -> str:
             if len(step.get("description", "")) > _STEP_DESC_MAX:
                 step["description"] = step["description"][:_STEP_DESC_MAX] + "…"
     return json.dumps(d, default=str, indent=2)
+
+
+def _slim_sheet_structure(ss: dict | None) -> dict | None:
+    """Strip dataBlocks from sheet_structure — keeps sheet names/usedRange/namedRanges for navigation."""
+    if not ss:
+        return None
+    return {
+        "spreadsheetId": ss.get("spreadsheetId"),
+        "title":         ss.get("title"),
+        "namedRanges":   ss.get("namedRanges", []),
+        "sheets": [
+            {k: v for k, v in s.items() if k != "dataBlocks"}
+            for s in ss.get("sheets", [])
+        ],
+    }
+
+
+def _ctx_planner(tc: TaskContext) -> str:
+    return json.dumps({
+        "user_request":      tc.user_request,
+        "spreadsheet_id":    tc.spreadsheet_id,
+        "active_sheet_id":   tc.active_sheet_id,
+        "sheet_structure":   tc.sheet_structure,
+        "user_notes":        tc.user_notes,
+        "current_iteration": tc.current_iteration,
+    }, default=str, indent=2)
+
+
+def _ctx_replanner(tc: TaskContext) -> str:
+    plan = tc.plan or {}
+    chains = plan.get("chains") or []
+    if not chains and plan.get("steps"):
+        chains = [{"id": "C1", "steps": plan["steps"]}]
+    condensed_chains = [
+        {**chain, "steps": [
+            {**s, "description": s["description"][:150] + "…"
+                   if len(s.get("description", "")) > 150 else s.get("description", "")}
+            for s in chain.get("steps", [])
+        ]}
+        for chain in chains
+    ]
+    exec_report = tc.execution_report or {}
+    condensed_exec = [
+        {"id": s["id"], "status": s["status"],
+         "evidence": s.get("evidence", "")[:_REPLAN_EVIDENCE_MAX]}
+        for s in exec_report.get("steps_executed", [])
+    ]
+    plan_out = {k: v for k, v in plan.items() if k not in ("chains", "steps")}
+    plan_out["chains"] = condensed_chains
+    return json.dumps({
+        "user_request":      tc.user_request,
+        "spreadsheet_id":    tc.spreadsheet_id,
+        "active_sheet_id":   tc.active_sheet_id,
+        "sheet_structure":   tc.sheet_structure,
+        "user_notes":        tc.user_notes,
+        "current_iteration": tc.current_iteration,
+        "plan":              plan_out,
+        "execution_report":  {**exec_report, "steps_executed": condensed_exec},
+        "verification_report": tc.verification_report,
+    }, default=str, indent=2)
+
+
+def _ctx_execution(tc: TaskContext) -> str:
+    plan = tc.plan or {}
+    return json.dumps({
+        "user_request":    tc.user_request,
+        "spreadsheet_id":  tc.spreadsheet_id,
+        "active_sheet_id": tc.active_sheet_id,
+        "sheet_structure": tc.sheet_structure,
+        "plan": {
+            "goal":                  plan.get("goal", ""),
+            "verification_criteria": plan.get("verification_criteria", []),
+        },
+    }, default=str, indent=2)
+
+
+def _compact_step_input(step: dict, completed_steps: list) -> str:
+    # Strip complexity (orchestrator-only). completed is just IDs — step descriptions
+    # are self-contained in each step's own input; only successful steps are listed.
+    step_clean = {k: v for k, v in step.items() if k != "complexity"}
+    completed_ids = [s["id"] for s in completed_steps]
+    return json.dumps({"step": step_clean, "completed": completed_ids})
+
+
+def _ctx_verifier(tc: TaskContext) -> str:
+    plan = tc.plan or {}
+    exec_report = tc.execution_report or {}
+    condensed_steps = [
+        {"id": s["id"], "status": s["status"]}
+        for s in exec_report.get("steps_executed", [])
+    ]
+    return json.dumps({
+        "user_request":    tc.user_request,
+        "spreadsheet_id":  tc.spreadsheet_id,
+        "active_sheet_id": tc.active_sheet_id,
+        "sheet_structure": _slim_sheet_structure(tc.sheet_structure),
+        "plan": {
+            "goal":                  plan.get("goal", ""),
+            "verification_criteria": plan.get("verification_criteria", []),
+        },
+        "execution_report": {
+            "steps_executed": condensed_steps,
+            "artifacts":      exec_report.get("artifacts", {}),
+            "notes":          exec_report.get("notes", ""),
+        },
+        "current_iteration": tc.current_iteration,
+    }, default=str, indent=2)
+
+
+def _ctx_basic(tc: TaskContext) -> str:
+    plan = tc.plan or {}
+    exec_report = tc.execution_report or {}
+    condensed_steps = [
+        {"id": s["id"], "status": s["status"],
+         "summary": s.get("evidence", "")[:120]}
+        for s in exec_report.get("steps_executed", [])
+    ]
+    return json.dumps({
+        "user_request": tc.user_request,
+        "status":       tc.status,
+        "plan":         {"goal": plan.get("goal", "")},
+        "execution_report": {
+            "steps_executed": condensed_steps,
+            "artifacts":      exec_report.get("artifacts", {}),
+        },
+        "verification_report": tc.verification_report,
+    }, default=str, indent=2)
 
 
 def _topo_sort(steps: list) -> list:
@@ -137,18 +277,31 @@ def _topo_sort(steps: list) -> list:
     return result
 
 
-def _log_task_context(agent_type: str, tc: TaskContext, slim: bool = False) -> None:
-    """Log the full serialized task_context being sent to an agent. Useful for debugging
-    why an agent is making a decision (wrong sheet structure, stale plan, etc.)."""
-    serialized = _serialize_task_context(tc, slim=slim)
+def _get_chains(plan: dict) -> list:
+    """Return chains from plan. Falls back to a single chain for legacy flat steps[] plans."""
+    chains = plan.get("chains") or []
+    if chains:
+        return chains
+    steps = plan.get("steps") or []
+    if steps:
+        logger.warning("[PLAN] Legacy flat steps[] format detected — wrapping in single chain")
+        return [{"id": "C1", "steps": steps}]
+    return []
+
+
+def _log_task_context(agent_type: str, serialized: str, tc: TaskContext) -> None:
+    """Log exactly what task_context the agent receives."""
+    chains = _get_chains(tc.plan or {})
+    total_steps = sum(len(c.get("steps", [])) for c in chains)
     logger.info(
-        "[TASK_CONTEXT → %s] status=%s iter=%d/%d sheet_id=%s plan_steps=%d serialized_len=%d",
+        "[TASK_CONTEXT → %s] status=%s iter=%d/%d sheet_id=%s chains=%d steps=%d ctx_len=%d",
         agent_type,
         tc.status,
         tc.current_iteration,
         tc.max_iteration,
         tc.active_sheet_id,
-        len((tc.plan or {}).get("steps", [])),
+        len(chains),
+        total_steps,
         len(serialized),
     )
     logger.info("[TASK_CONTEXT → %s body]\n%s", agent_type, serialized)
@@ -170,10 +323,7 @@ def _parse_output(raw_result: dict) -> dict:
 
 @chat_bp.route("/api/v1/chat", methods=["POST"])
 def chat():
-    # P5: reload token on every request so an expired token doesn't stay stale
-    # indefinitely. File read + service construction are cheap (no network call).
-    access_token = load_access_token_from_file()
-    sheet_service = build_sheets_service(access_token)
+    sheet_service = _get_sheet_service()
 
     data = request.get_json()
 
@@ -273,11 +423,13 @@ def chat():
                 agent = getAgent(agent_type, effort)
                 task_context.sheet_structure = read_sheet_structure(sheet_service, spreadsheet_id)
 
-                _log_task_context(agent_type, task_context)
+                ctx_fn = _ctx_planner if agent_type == "planner" else _ctx_replanner
+                agent_ctx = ctx_fn(task_context)
+                _log_task_context(agent_type, agent_ctx, task_context)
 
                 llm_start = time.time()
                 raw_result = agent.invoke({
-                    "task_context": _serialize_task_context(task_context),
+                    "task_context": agent_ctx,
                     "input": query,
                     "chat_history": request_history,
                 })
@@ -303,8 +455,9 @@ def chat():
                     task_context.plan = parsed.get("plan", {})
                     task_context.execution_report = {}
                     task_context.verification_report = {}
-                    plan = task_context.plan or {}
-                    logger.info(f"[AGENT LOOP] Plan ready with {len(plan.get('steps', []))} steps")
+                    chains = _get_chains(task_context.plan or {})
+                    total_steps = sum(len(c.get("steps", [])) for c in chains)
+                    logger.info(f"[AGENT LOOP] Plan ready — {len(chains)} chain(s), {total_steps} step(s)")
                 else:
                     request_history.append(AIMessage(content=raw_result.get("output", "")))
                     request_history.append(HumanMessage(content="Your last output was either not valid JSON or lacked a recognized 'status'. Please try again and ensure your response is a valid JSON block containing 'status' as either 'ready' or 'needs_clarification'."))
@@ -312,114 +465,124 @@ def chat():
                     continue
 
             elif task_context.status == "executing":
-                plan_steps = (task_context.plan or {}).get("steps", [])
-                sorted_steps = _topo_sort(plan_steps)
-                logger.info(f"[PHASE] EXECUTING - {len(sorted_steps)} steps to execute")
-
-                completed_steps: list = []
-                all_step_results: list = []
-                sheets_modified_set: set = set()
-                ranges_written_list: list = []
-                step_failed = False
+                chains = _get_chains(task_context.plan or {})
+                total_steps = sum(len(c.get("steps", [])) for c in chains)
+                logger.info(f"[PHASE] EXECUTING — {len(chains)} chain(s), {total_steps} total steps")
 
                 task_context.sheet_structure = read_sheet_structure(sheet_service, spreadsheet_id)
-                serialized_context = _serialize_task_context(task_context)
+                serialized_context = _ctx_execution(task_context)
 
-                _log_task_context("execution", task_context)
+                def run_chain(chain: dict) -> dict:
+                    chain_id = chain.get("id", "?")
+                    chain_steps = _topo_sort(chain.get("steps", []))
+                    completed: list = []
+                    results: list = []
+                    sheets_mod: set = set()
+                    ranges_wr: list = []
+                    timings: list = []
+                    failed_calls_local: list = []
+                    fast_calls = 0
+                    effort_calls = 0
+                    chain_failed = False
 
-                for step in sorted_steps:
-                    step_id = step.get("id", "?")
-                    complexity = step.get("complexity", "low")
-                    llm_type = effort if complexity == "high" else "fast"
+                    for step in chain_steps:
+                        step_id   = step.get("id", "?")
+                        llm_type  = effort if step.get("complexity", "low") == "high" else "fast"
+                        logger.info(f"[CHAIN {chain_id}] Step {step_id}: {step.get('description','')[:80]}... ({llm_type})")
 
-                    logger.info(f"[EXECUTION] Step {step_id}: {step.get('description', '')[:80]}... (complexity: {complexity}, llm: {llm_type})")
+                        step_input      = _compact_step_input(step, completed)
+                        execution_agent = getAgent("execution", llm_type)
+                        if llm_type == "fast":
+                            fast_calls += 1
+                        else:
+                            effort_calls += 1
 
-                    step_input = json.dumps({
-                        "step": step,
-                        "completed_steps": completed_steps,
-                    })
-                    execution_agent = getAgent("execution", llm_type)
-                    if llm_type == "fast":
-                        stats["fast_agent_calls"] += 1
-                    else:
-                        stats["effort_agent_calls"] += 1
-
-                    step_start = time.time()
-                    tool_call_start = time.time()
-                    try:
-                        raw_result = execution_agent.invoke({
-                            "task_context": serialized_context,
-                            "input": step_input,
-                        })
-                        tool_call_time = time.time() - tool_call_start
-                    except Exception as te:
-                        tool_call_time = time.time() - tool_call_start
-                        stats["tool_call_timings"].append({
-                            "step_id": step_id,
-                            "tool": "execution_agent",
-                            "duration": tool_call_time,
-                            "error": str(te),
-                        })
-                        if len(stats["failed_tool_calls"]) < 10:
-                            stats["failed_tool_calls"].append({
-                                "step_id": step_id,
-                                "request": step_input[:500],
-                                "exception": str(te),
+                        t0 = time.time()
+                        try:
+                            raw_result = execution_agent.invoke({
+                                "task_context": serialized_context,
+                                "input": step_input,
                             })
-                        raise
+                            duration = time.time() - t0
+                        except Exception as e:
+                            duration = time.time() - t0
+                            timings.append({"step_id": step_id, "tool": "execution_agent", "duration": duration, "error": str(e)})
+                            failed_calls_local.append({"step_id": step_id, "request": step_input[:500], "exception": str(e)})
+                            results.append({"id": step_id, "status": "failed", "evidence": f"Exception: {str(e)[:300]}"})
+                            chain_failed = True
+                            logger.error(f"[CHAIN {chain_id}] Step {step_id} exception: {e}")
+                            break
 
-                    parsed = _parse_output(raw_result)
+                        parsed      = _parse_output(raw_result)
+                        step_status = parsed.get("status", "failed")
+                        evidence    = parsed.get("evidence", "")
 
-                    step_status = parsed.get("status", "failed")
-                    evidence = parsed.get("evidence", "")
+                        timings.append({"step_id": step_id, "tool": "execution_agent", "duration": duration})
+                        results.append({"id": step_id, "status": step_status, "evidence": evidence})
+                        for sheet in parsed.get("sheets_modified", []):
+                            sheets_mod.add(sheet)
+                        ranges_wr.extend(parsed.get("ranges_written", []))
 
-                    stats["tool_call_timings"].append({
-                        "step_id": step_id,
-                        "tool": "execution_agent",
-                        "duration": tool_call_time,
-                    })
+                        if step_status == "failed":
+                            logger.warning(f"[CHAIN {chain_id}] Step {step_id} FAILED — stopping chain")
+                            chain_failed = True
+                            break
 
-                    all_step_results.append({
-                        "id": step_id,
-                        "status": step_status,
-                        "evidence": evidence,
-                    })
-                    for sheet in parsed.get("sheets_modified", []):
-                        sheets_modified_set.add(sheet)
-                    ranges_written_list.extend(parsed.get("ranges_written", []))
+                        completed.append({"id": step_id, "status": step_status, "summary": evidence[:400]})
+                        logger.info(f"[CHAIN {chain_id}] Step {step_id} done in {duration:.2f}s")
 
-                    if step_status == "failed":
-                        logger.warning(f"[EXECUTION] Step {step_id} FAILED - skipping remaining steps")
-                        step_failed = True
-                        break
+                    executed_ids = {r["id"] for r in results}
+                    for step in chain_steps:
+                        if step["id"] not in executed_ids:
+                            results.append({"id": step["id"], "status": "skipped", "evidence": "Skipped — a prior step in this chain failed."})
 
-                    completed_steps.append({
-                        "id": step_id,
-                        "status": step_status,
-                        "summary": evidence[:400],
-                    })
-                    logger.info(f"[EXECUTION] Step {step_id} completed in {time.time() - step_start:.2f}s")
+                    return {
+                        "results":       results,
+                        "sheets_modified": sheets_mod,
+                        "ranges_written":  ranges_wr,
+                        "failed":        chain_failed,
+                        "fast_calls":    fast_calls,
+                        "effort_calls":  effort_calls,
+                        "timings":       timings,
+                        "failed_calls":  failed_calls_local,
+                    }
 
-                # Mark any steps that never ran as skipped.
-                executed_ids = {r["id"] for r in all_step_results}
-                for step in plan_steps:
-                    if step["id"] not in executed_ids:
-                        all_step_results.append({
-                            "id": step["id"],
-                            "status": "skipped",
-                            "evidence": "Skipped — a prior step failed.",
-                        })
+                all_step_results:   list = []
+                sheets_modified_set: set = set()
+                ranges_written_list: list = []
+                any_chain_failed = False
+
+                with ThreadPoolExecutor(max_workers=len(chains)) as executor:
+                    futures = {executor.submit(run_chain, chain): chain.get("id", "?") for chain in chains}
+                    for future in as_completed(futures):
+                        chain_id = futures[future]
+                        try:
+                            cr = future.result()
+                            all_step_results.extend(cr["results"])
+                            sheets_modified_set.update(cr["sheets_modified"])
+                            ranges_written_list.extend(cr["ranges_written"])
+                            if cr["failed"]:
+                                any_chain_failed = True
+                            stats["fast_agent_calls"]  += cr["fast_calls"]
+                            stats["effort_agent_calls"] += cr["effort_calls"]
+                            stats["tool_call_timings"].extend(cr["timings"])
+                            cap = max(0, 10 - len(stats["failed_tool_calls"]))
+                            stats["failed_tool_calls"].extend(cr["failed_calls"][:cap])
+                        except Exception as e:
+                            logger.error(f"[CHAIN {chain_id}] Unexpected future error: {e}")
+                            any_chain_failed = True
+                            all_step_results.append({"id": f"chain_{chain_id}_error", "status": "failed", "evidence": f"Chain error: {str(e)[:300]}"})
 
                 task_context.execution_report = {
                     "steps_executed": all_step_results,
                     "artifacts": {
                         "sheets_modified": list(sheets_modified_set),
-                        "ranges_written": ranges_written_list,
+                        "ranges_written":  ranges_written_list,
                     },
                     "notes": "",
                 }
-                task_context.status = "replanning" if step_failed else "verifying"
-                logger.info(f"[PHASE] Executing complete - {len(all_step_results)} steps executed, transitioning to {task_context.status}")
+                task_context.status = "replanning" if any_chain_failed else "verifying"
+                logger.info(f"[PHASE] Executing complete — {len(all_step_results)} steps across {len(chains)} chain(s), transitioning to {task_context.status}")
 
             elif task_context.status == "verifying":
                 logger.info(f"[PHASE] VERIFYING")
@@ -429,11 +592,12 @@ def chat():
                 stats["fast_agent_calls"] += 1
                 task_context.sheet_structure = read_sheet_structure(sheet_service, spreadsheet_id)
 
-                _log_task_context("verifier", task_context)
+                verifier_ctx = _ctx_verifier(task_context)
+                _log_task_context("verifier", verifier_ctx, task_context)
 
                 verify_start = time.time()
                 raw_result = verifier_agent.invoke({
-                    "task_context": _serialize_task_context(task_context),
+                    "task_context": verifier_ctx,
                     "input": query,
                     "chat_history": request_history,
                 })
@@ -537,10 +701,11 @@ def chat():
         )
 
     basic_agent = getAgent("basic", effort)
-    _log_task_context("basic", task_context, slim=True)
+    basic_ctx = _ctx_basic(task_context)
+    _log_task_context("basic", basic_ctx, task_context)
     basic_start = time.time()
     result = basic_agent.invoke({
-        "task_context": _serialize_task_context(task_context, slim=True),
+        "task_context": basic_ctx,
         "input": query,
         "system_prompt": basic_system_prompt,
         "chat_history": request_history,

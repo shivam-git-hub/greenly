@@ -503,6 +503,10 @@ class LLMAgents:
 # requests for a single-user add-on — the only mutable state is search_budget,
 # which is always reset before each agent call via getAgent / _invoke_researcher.
 _llm_agents_cache: dict = {}
+# AgentExecutor is stateless between invocations (all per-call state lives in the
+# invoke() input/scratchpad). Cache it to avoid repeated LangChain chain assembly,
+# tool schema binding, and pydantic validation on every getAgent() call.
+_executor_cache: dict[tuple, AgentExecutor] = {}
 
 
 def getAgent(agentType: str, llm_type: str = "fast"):
@@ -530,10 +534,13 @@ def getAgent(agentType: str, llm_type: str = "fast"):
     if search_limit > 0:
         llmAgents.search_budget.reset(limit=search_limit)
 
-    return AgentExecutor(
-        agent=agent,
-        tools=tools,
-        max_iterations=max_iter,
-        verbose=True,
-        handle_parsing_errors=True,
-    )
+    cache_key = (agentType, llm_type)
+    if cache_key not in _executor_cache:
+        _executor_cache[cache_key] = AgentExecutor(
+            agent=agent,
+            tools=tools,
+            max_iterations=max_iter,
+            verbose=True,
+            handle_parsing_errors=True,
+        )
+    return _executor_cache[cache_key]
