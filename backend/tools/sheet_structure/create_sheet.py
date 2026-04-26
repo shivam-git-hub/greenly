@@ -63,3 +63,65 @@ def create_sheet(
     except Exception as e:
         logger.error("Error creating sheet: %s", e)
         return {"success": False, "error": str(e)}
+
+
+def resize_sheet(
+    service,
+    spreadsheetId: str,
+    sheetId: int,
+    rowCount: int,
+    columnCount: int,
+) -> dict:
+    """
+    Resize an existing sheet by updating its gridProperties.
+
+    Args:
+        spreadsheetId: The ID of the target spreadsheet.
+        sheetId: The numeric ID of the sheet to resize.
+        rowCount: New row count.
+        columnCount: New column count.
+
+    Returns:
+        dict: {"success": True, "sheetId": ..., "rowCount": ..., "columnCount": ...}
+              or {"success": False, "error": ...}
+    """
+    req = {
+        "spreadsheetId": spreadsheetId,
+        "sheetId": sheetId,
+        "rowCount": rowCount,
+        "columnCount": columnCount,
+    }
+    logger.info("resize_sheet request: %s", req)
+
+    try:
+        result = service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheetId,
+            body={
+                "requests": [
+                    {
+                        "updateSheetProperties": {
+                            "properties": {
+                                "sheetId": sheetId,
+                                "gridProperties": {
+                                    "rowCount": rowCount,
+                                    "columnCount": columnCount,
+                                },
+                            },
+                            "fields": "gridProperties(rowCount,columnCount)",
+                        }
+                    }
+                ]
+            },
+        ).execute()
+
+        response = {
+            "success": True,
+            "sheetId": sheetId,
+            "rowCount": rowCount,
+            "columnCount": columnCount,
+        }
+        logger.info("resize_sheet response: %s", response)
+        return response
+    except Exception as e:
+        logger.error("Error resizing sheet: %s", e)
+        return {"success": False, "error": str(e)}

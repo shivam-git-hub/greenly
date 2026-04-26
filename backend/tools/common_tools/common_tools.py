@@ -899,7 +899,8 @@ def write_df_to_sheet(
 
         result = write_values(service, spreadsheetId, range, rows)
         return {
-            **result,
+            "success": result["success"],
+            "updatedRange": result.get("updatedRange"),
             "varName": varName,
             "rowsWritten": len(rows),
             "shape": list(df.shape),

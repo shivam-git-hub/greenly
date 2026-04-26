@@ -157,21 +157,76 @@ def get_sheet_id_by_name(service, spreadsheet_id: str, sheet_name: str) -> int:
     raise ValueError(f"Sheet '{sheet_name}' not found in spreadsheet '{spreadsheet_id}'")
 
 
-def normalize_color(color: dict) -> dict:
+def normalize_color(color) -> dict:
     """
-    Normalise a colour dict to the Sheets API format {red, green, blue}.
+    Normalise a colour dict (or string) to the Sheets API format {red, green, blue}.
 
-    Accepts both shorthand {r, g, b} and full {red, green, blue} keys so
-    callers don't need to care which convention is used in request payloads.
+    Accepts:
+    - Dict with r/g/b or red/green/blue keys, values 0.0-1.0
+    - Color name strings: "green", "red", "blue", "white", "black", "yellow", etc.
+    - Hex strings: "#00FF00", "#0F0", "00FF00"
 
     Args:
-        color: Dict with r/g/b or red/green/blue keys, values 0.0-1.0.
+        color: Dict or string with color value.
 
     Returns:
         dict: {red, green, blue} as expected by the Sheets API Color type.
     """
     if not color:
         return {}
+
+    # Handle string colors (name or hex)
+    if isinstance(color, str):
+        color = color.strip().lower()
+        # Common color names to RGB (0.0-1.0 range)
+        color_map = {
+            "black":  {"r": 0.0, "g": 0.0, "b": 0.0},
+            "white": {"r": 1.0, "g": 1.0, "b": 1.0},
+            "red":   {"r": 1.0, "g": 0.0, "b": 0.0},
+            "green": {"r": 0.0, "g": 0.8, "b": 0.0},
+            "blue":  {"r": 0.0, "g": 0.0, "b": 1.0},
+            "yellow": {"r": 1.0, "g": 1.0, "b": 0.0},
+            "cyan": {"r": 0.0, "g": 1.0, "b": 1.0},
+            "magenta": {"r": 1.0, "g": 0.0, "b": 1.0},
+            "orange": {"r": 1.0, "g": 0.647, "b": 0.0},
+            "purple": {"r": 0.58, "g": 0.0, "b": 0.58},
+            "pink": {"r": 1.0, "g": 0.753, "b": 0.796},
+            "gray": {"r": 0.5, "g": 0.5, "b": 0.5},
+            "grey": {"r": 0.5, "g": 0.5, "b": 0.5},
+            "dark green": {"r": 0.118, "g": 0.306, "b": 0.169},
+            "light green": {"r": 0.565, "g": 0.933, "b": 0.565},
+            "navy": {"r": 0.0, "g": 0.0, "b": 0.502},
+            "teal": {"r": 0.0, "g": 0.502, "b": 0.502},
+            "maroon": {"r": 0.502, "g": 0.0, "b": 0.0},
+            "olive": {"r": 0.502, "g": 0.502, "b": 0.0},
+            "silver": {"r": 0.753, "g": 0.753, "b": 0.753},
+            "lime": {"r": 0.196, "g": 0.804, "b": 0.196},
+            "aqua": {"r": 0.0, "g": 1.0, "b": 1.0},
+            "fuchsia": {"r": 1.0, "g": 0.0, "b": 1.0},
+        }
+        if color in color_map:
+            return color_map[color]
+
+        # Try hex color (with or without #)
+        hex_match = color.lstrip("#")
+        if len(hex_match) in (3, 6, 8):
+            try:
+                if len(hex_match) == 3:
+                    # Short form: #0F0 -> #00FF00
+                    hex_match = "".join(c * 2 for c in hex_match)
+                # Parse full hex
+                num = int(hex_match, 16)
+                r = ((num >> 16) & 0xFF) / 255.0
+                g = ((num >> 8) & 0xFF) / 255.0
+                b = (num & 0xFF) / 255.0
+                return {"red": r, "green": g, "blue": b}
+            except (ValueError, TypeError):
+                pass
+
+        # Unknown string - return safe default
+        return {"red": 0, "green": 0, "blue": 0}
+
+    # Handle dict with r/g/b or red/green/blue
     return {
         "red":   color.get("red",   color.get("r", 0)),
         "green": color.get("green", color.get("g", 0)),

@@ -148,8 +148,8 @@ class ApplyCellFormatInput(BaseModel):
     spreadsheetId: str
     range: str
     numberFormat: Optional[Dict[str, Any]] = None
-    backgroundColor: Optional[Dict[str, Any]] = None
-    textColor: Optional[Dict[str, Any]] = None
+    backgroundColor: Optional[Union[str, Dict[str, Any]]] = None
+    textColor: Optional[Union[str, Dict[str, Any]]] = None
     bold: bool = None
     italic: bool = None
     fontSize: int = None

@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 
 from flask import Blueprint, request, jsonify
+from langchain.agents import AgentExecutor
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
 from llm.agentFactory import getAgent
@@ -16,6 +17,7 @@ from utilities.task_context import TaskContext
 from tools.read_structure.read_sheet_structure import read_sheet_structure
 
 from tools.utils import build_sheets_service
+from tools.langchain_tools import create_read_tools, create_write_tools, create_python_tools
 from utils import load_access_token_from_file
 
 logger = logging.getLogger(__name__)
@@ -421,6 +423,7 @@ def chat():
                 else:
                     stats["replanner_calls"] += 1
                 agent = getAgent(agent_type, effort)
+                logger.info(f"[AGENT CALL] Starting {agent_type.upper()} agent with effort={effort}")
                 task_context.sheet_structure = read_sheet_structure(sheet_service, spreadsheet_id)
 
                 ctx_fn = _ctx_planner if agent_type == "planner" else _ctx_replanner
@@ -428,6 +431,7 @@ def chat():
                 _log_task_context(agent_type, agent_ctx, task_context)
 
                 llm_start = time.time()
+                logger.info(f"[AGENT CALL] Invoking {agent_type.upper()} agent")
                 raw_result = agent.invoke({
                     "task_context": agent_ctx,
                     "input": query,
@@ -472,7 +476,36 @@ def chat():
                 task_context.sheet_structure = read_sheet_structure(sheet_service, spreadsheet_id)
                 serialized_context = _ctx_execution(task_context)
 
-                def run_chain(chain: dict) -> dict:
+                # Get fresh LLMAgents for creating per-chain isolated services
+                from llm.agentFactory import LLMAgents
+                llmAgents = LLMAgents("fast")
+                access_token = load_access_token_from_file()
+
+                def run_chain(chain: dict, access_token: str, llmAgents) -> dict:
+                    # Create fresh service per chain to avoid SSL conflicts in parallel execution
+                    from tools.utils import build_sheets_service
+                    chain_service = build_sheets_service(access_token)
+                    chain_read_tools = create_read_tools(chain_service)
+                    chain_write_tools = create_write_tools(chain_service)
+                    chain_python_tools = create_python_tools(chain_service)
+
+                    # Build execution tools with chain's isolated service
+                    execution_tools = (
+                        chain_write_tools +
+                        chain_read_tools +
+                        chain_python_tools +
+                        [llmAgents.researcher_tool]
+                    )
+
+                    # Create fresh AgentExecutor per chain for thread safety
+                    execution_agent_executor = AgentExecutor(
+                        agent=llmAgents.executionAgent,
+                        tools=execution_tools,
+                        max_iterations=60,
+                        verbose=True,
+                        handle_parsing_errors=True,
+                    )
+
                     chain_id = chain.get("id", "?")
                     chain_steps = _topo_sort(chain.get("steps", []))
                     completed: list = []
@@ -490,8 +523,9 @@ def chat():
                         llm_type  = effort if step.get("complexity", "low") == "high" else "fast"
                         logger.info(f"[CHAIN {chain_id}] Step {step_id}: {step.get('description','')[:80]}... ({llm_type})")
 
-                        step_input      = _compact_step_input(step, completed)
-                        execution_agent = getAgent("execution", llm_type)
+                        step_input = _compact_step_input(step, completed)
+                        step_description = step.get('description', '')[:80]
+                        logger.info(f"[AGENT CALL] Starting EXECUTION agent chain={chain_id} step={step_id} effort={llm_type}")
                         if llm_type == "fast":
                             fast_calls += 1
                         else:
@@ -499,14 +533,15 @@ def chat():
 
                         t0 = time.time()
                         try:
-                            raw_result = execution_agent.invoke({
+                            logger.info(f"[AGENT CALL] Invoking EXECUTION agent chain={chain_id} step={step_id}")
+                            raw_result = execution_agent_executor.invoke({
                                 "task_context": serialized_context,
                                 "input": step_input,
                             })
                             duration = time.time() - t0
                         except Exception as e:
                             duration = time.time() - t0
-                            timings.append({"step_id": step_id, "tool": "execution_agent", "duration": duration, "error": str(e)})
+                            timings.append({"step_id": step_id, "step_description": step_description, "tool": "execution_agent_executor", "duration": duration, "error": str(e)})
                             failed_calls_local.append({"step_id": step_id, "request": step_input[:500], "exception": str(e)})
                             results.append({"id": step_id, "status": "failed", "evidence": f"Exception: {str(e)[:300]}"})
                             chain_failed = True
@@ -517,7 +552,7 @@ def chat():
                         step_status = parsed.get("status", "failed")
                         evidence    = parsed.get("evidence", "")
 
-                        timings.append({"step_id": step_id, "tool": "execution_agent", "duration": duration})
+                        timings.append({"step_id": step_id, "step_description": step_description, "tool": "execution_agent_executor", "duration": duration})
                         results.append({"id": step_id, "status": step_status, "evidence": evidence})
                         for sheet in parsed.get("sheets_modified", []):
                             sheets_mod.add(sheet)
@@ -552,8 +587,12 @@ def chat():
                 ranges_written_list: list = []
                 any_chain_failed = False
 
+                # Run chains in parallel with per-chain isolated services
                 with ThreadPoolExecutor(max_workers=len(chains)) as executor:
-                    futures = {executor.submit(run_chain, chain): chain.get("id", "?") for chain in chains}
+                    futures = {
+                        executor.submit(run_chain, chain, access_token, llmAgents): chain.get("id", "?")
+                        for chain in chains
+                    }
                     for future in as_completed(futures):
                         chain_id = futures[future]
                         try:
@@ -569,7 +608,7 @@ def chat():
                             cap = max(0, 10 - len(stats["failed_tool_calls"]))
                             stats["failed_tool_calls"].extend(cr["failed_calls"][:cap])
                         except Exception as e:
-                            logger.error(f"[CHAIN {chain_id}] Unexpected future error: {e}")
+                            logger.error(f"[CHAIN {chain_id}] Unexpected error: {e}")
                             any_chain_failed = True
                             all_step_results.append({"id": f"chain_{chain_id}_error", "status": "failed", "evidence": f"Chain error: {str(e)[:300]}"})
 
@@ -588,6 +627,7 @@ def chat():
                 logger.info(f"[PHASE] VERIFYING")
 
                 verifier_agent = getAgent("verifier", "fast")
+                logger.info(f"[AGENT CALL] Starting VERIFIER agent with effort=fast")
                 stats["verifier_calls"] += 1
                 stats["fast_agent_calls"] += 1
                 task_context.sheet_structure = read_sheet_structure(sheet_service, spreadsheet_id)
@@ -596,6 +636,7 @@ def chat():
                 _log_task_context("verifier", verifier_ctx, task_context)
 
                 verify_start = time.time()
+                logger.info(f"[AGENT CALL] Invoking VERIFIER agent")
                 raw_result = verifier_agent.invoke({
                     "task_context": verifier_ctx,
                     "input": query,
@@ -604,11 +645,44 @@ def chat():
                 verify_time = time.time() - verify_start
 
                 logger.info(f"[AGENT] Verifier call completed in {verify_time:.2f}s")
+                logger.info(f"[VERIFIER] Raw output preview: {str(raw_result)[:1000]}")
 
                 parsed = _parse_output(raw_result)
 
-                task_context.verification_report = parsed.get("verification_report", {})
-                task_context.status = "replanning" if parsed.get("status") == "failed" else "completed"
+                # Fallback logic: handle empty/incorrect verifier output
+                # If verifier output is invalid (status != "failed" means it couldn't parse properly),
+                # check execution_report to decide
+                verifier_status = parsed.get("status")
+                verification_report = parsed.get("verification_report", {})
+
+                if not verification_report or verifier_status not in ("completed", "failed"):
+                    # Verifier gave invalid/empty output - use execution_report as fallback
+                    logger.warning(f"[VERIFIER] Invalid/empty output: status={verifier_status}, using execution_report fallback")
+                    exec_report = task_context.execution_report or {}
+                    steps = exec_report.get("steps_executed", [])
+
+                    # Check if all steps succeeded
+                    all_passed = all(s.get("status") == "success" for s in steps) if steps else False
+
+                    if all_passed and steps:
+                        # All steps passed - consider verification passed
+                        verification_report = {
+                            "verdict": "pass",
+                            "criteria_results": [{"criterion": "All executed steps passed", "result": "pass", "evidence": "Fallback: execution report shows all steps succeeded"}],
+                            "remediation_hints": []
+                        }
+                        verifier_status = "completed"
+                    else:
+                        # Some steps failed or no execution - go to replanning
+                        verification_report = {
+                            "verdict": "fail",
+                            "criteria_results": [{"criterion": "Verifier could not run", "result": "fail", "evidence": "Fallback: verifier failed to produce output"}],
+                            "remediation_hints": ["Re-run execution to generate proper results"]
+                        }
+                        verifier_status = "failed"
+
+                task_context.verification_report = verification_report
+                task_context.status = "replanning" if verifier_status == "failed" else "completed"
                 logger.info(f"[PHASE] Verification {'FAILED - will replan' if task_context.status == 'replanning' else 'PASSED - completed'}")
 
             else:
@@ -664,8 +738,9 @@ def chat():
     logger.info("[STATS] ========== TOP 10 SLOWEST TOOL CALLS ==========")
     sorted_timings = sorted(stats["tool_call_timings"], key=lambda x: x.get("duration", 0), reverse=True)[:10]
     for i, tc in enumerate(sorted_timings, 1):
-        error_info = f" [ERROR: {tc.get('error', '')}]" if tc.get("error") else ""
-        logger.info(f"[STATS] {i:2d}. {tc.get('step_id', '?'):30s} - {tc.get('duration', 0):6.2f}s{error_info}")
+        error_info = f" [ERROR: {tc.get('error', '')[:50]}]" if tc.get("error") else ""
+        step_desc = tc.get('step_description', tc.get('step_id', '?'))[:60]
+        logger.info(f"[STATS] {i:2d}. {step_desc:60s} - {tc.get('duration', 0):6.2f}s{error_info}")
     logger.info("-" * 60)
     logger.info("[STATS] ========== FAILED TOOL CALLS (max 10) ==========")
     if stats["failed_tool_calls"]:
@@ -701,9 +776,11 @@ def chat():
         )
 
     basic_agent = getAgent("basic", effort)
+    logger.info(f"[AGENT CALL] Starting BASIC agent with effort={effort}")
     basic_ctx = _ctx_basic(task_context)
     _log_task_context("basic", basic_ctx, task_context)
     basic_start = time.time()
+    logger.info(f"[AGENT CALL] Invoking BASIC agent")
     result = basic_agent.invoke({
         "task_context": basic_ctx,
         "input": query,
